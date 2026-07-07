@@ -1,0 +1,12 @@
+services:
+  argus:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./sessions:/app/sessions
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
