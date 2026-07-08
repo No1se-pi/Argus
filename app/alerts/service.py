@@ -147,6 +147,11 @@ class AlertService:
 
     async def send_vk_post_alert(self, post: VkPost) -> None:
         if not await self._vk_alert_enabled("post"):
+            logger.info(
+                "VK post alert skipped: disabled for group_id=%s post_id=%s",
+                post.group_id,
+                post.post_id,
+            )
             return
         message = self._render_vk_post(post)
         await self._send_platform_alert(
@@ -160,6 +165,12 @@ class AlertService:
 
     async def send_vk_comment_alert(self, comment: VkComment) -> None:
         if not await self._vk_alert_enabled("comment"):
+            logger.info(
+                "VK comment alert skipped: disabled for group_id=%s post_id=%s comment_id=%s",
+                comment.group_id,
+                comment.post_id,
+                comment.comment_id,
+            )
             return
         message = self._render_vk_comment(comment)
         await self._send_platform_alert(
@@ -214,6 +225,13 @@ class AlertService:
                 message=message,
                 status="sent",
                 sent_at=datetime.now(UTC).isoformat(),
+            )
+            logger.info(
+                "Sent %s %s alert for %s to chat %s",
+                platform,
+                alert_type,
+                item_id,
+                chat_id,
             )
 
     def _render_vk_post(self, post: VkPost) -> str:

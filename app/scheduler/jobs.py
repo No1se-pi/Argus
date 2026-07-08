@@ -97,8 +97,10 @@ class BackgroundScheduler:
             return
         result = await self.collector.sync_posts(source)
         logger.info(
-            "Telegram source %s posts sync: initialized=%s fetched=%s saved=%s new=%s last_message_id=%s",
+            "Telegram source %s (%s, mode=%s) posts sync: initialized=%s fetched=%s saved=%s new=%s last_message_id=%s",
             source.id,
+            source.display_name,
+            source.telegram_monitor_mode,
             result.initialized,
             result.fetched_count,
             result.saved_count,
@@ -119,8 +121,10 @@ class BackgroundScheduler:
             return
         result = await self.collector.sync_discussion(source)
         logger.info(
-            "Telegram source %s discussion sync: initialized=%s fetched=%s saved=%s new=%s last_message_id=%s",
+            "Telegram source %s (%s, mode=%s) discussion sync: initialized=%s fetched=%s saved=%s new=%s last_message_id=%s",
             source.id,
+            source.display_name,
+            source.telegram_monitor_mode,
             result.initialized,
             result.fetched_count,
             result.saved_count,

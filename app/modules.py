@@ -108,6 +108,7 @@ class ModuleRegistry:
             "/tg_posts",
             "/tg_dashboard",
             "/tg_sync_posts",
+            "/tg_set_mode",
             "/add_source",
             "/sources",
             "/dashboard",
@@ -219,6 +220,7 @@ class ModuleRegistry:
                         "/tg_posts",
                         "/tg_dashboard",
                         "/tg_sync_posts",
+                        "/tg_set_mode",
                     ]
                 )
         return sorted(set(disabled))

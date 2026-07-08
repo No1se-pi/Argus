@@ -72,6 +72,7 @@ Telegram Monitor:
 /tg_posts &lt;source_id_or_telegram_id&gt; &lt;period&gt; [limit]
 /tg_dashboard &lt;source_id_or_telegram_id&gt; &lt;period&gt;
 /tg_sync_posts &lt;source_id&gt;
+/tg_set_mode &lt;source_id&gt; &lt;posts|discussion&gt;
 
 Legacy Telegram commands still work when Telegram Monitor is available:
 /sources
@@ -576,6 +577,62 @@ async def sync_posts_command(
     await message.answer(
         f"Синхронизация завершена. Получено: {result.fetched_count}, "
         f"новых сохранено: {result.saved_count}."
+    )
+
+
+@router.message(Command("tg_set_mode"))
+async def tg_set_mode_command(
+    message: Message,
+    command: CommandObject,
+    collector: TelegramCollector | None,
+    source_repo: SourceRepository,
+    module_registry: ModuleRegistry,
+) -> None:
+    if not await _ensure_telegram_available(message, module_registry):
+        return
+
+    args = (command.args or "").split()
+    if len(args) != 2:
+        await message.answer("Использование: /tg_set_mode <source_id> <posts|discussion>")
+        return
+
+    try:
+        source_id = _parse_int_token(args[0])
+    except ValueError:
+        await message.answer("source_id должен быть числом из /tg_sources.")
+        return
+
+    mode = args[1].strip().lower()
+    if mode not in {"posts", "discussion"}:
+        await message.answer("Режим должен быть posts или discussion.")
+        return
+
+    source = await source_repo.get_source(source_id)
+    if source is None or not source.is_active:
+        await message.answer("Источник не найден или отключён. Посмотри список: /tg_sources.")
+        return
+
+    await source_repo.update_monitor_settings(source_id, monitor_mode=mode)
+    updated = await source_repo.get_source(source_id)
+    if updated is None:
+        await message.answer("Режим обновлён, но источник не удалось перечитать.")
+        return
+
+    baseline_text = (
+        await _initialize_source_baseline(collector, updated)
+        if collector is not None
+        else "Baseline не выставлен: Telethon client is not running."
+    )
+    await message.answer(
+        "\n".join(
+            [
+                "Режим источника обновлён.",
+                f"ID: {updated.id}",
+                f"Название: {escape(updated.display_name)}",
+                f"Режим: {updated.telegram_monitor_mode}",
+                baseline_text,
+            ]
+        )
     )
 
 
