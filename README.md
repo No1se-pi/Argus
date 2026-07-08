@@ -1,6 +1,7 @@
 # Argus
 
-Argus is a Python 3.11+ Telegram control bot for social monitoring, alerts, and dashboards.
+Argus is a Python 3.10+ Telegram control bot for social monitoring, alerts, and dashboards.
+Python 3.11 is still the recommended runtime and the Docker image uses it.
 
 The management UI is always the Telegram bot. Monitors are independent modules:
 
