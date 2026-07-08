@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from app.analytics.dashboard import DashboardService
 from app.storage.database import Database
@@ -12,6 +12,8 @@ from app.storage.models import (
     VkPost,
     VkSource,
 )
+
+UTC = timezone.utc
 
 
 def utc_now_iso() -> str:

@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from telethon import TelegramClient, errors, types, utils
@@ -15,6 +15,7 @@ from app.storage.models import Post, Source, TelegramGroupMessage
 from app.storage.repositories import RepositoryBundle
 
 logger = logging.getLogger(__name__)
+UTC = timezone.utc
 
 
 class TelegramSourceError(Exception):

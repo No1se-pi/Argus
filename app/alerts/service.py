@@ -1,5 +1,5 @@
 import logging
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from html import escape
 
 from aiogram import Bot
@@ -17,6 +17,7 @@ from app.storage.models import (
 from app.storage.repositories import AlertRepository, RuntimeSettingsRepository
 
 logger = logging.getLogger(__name__)
+UTC = timezone.utc
 
 
 class AlertService:

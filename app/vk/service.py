@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from html import escape
 from typing import Any
 
@@ -17,6 +17,7 @@ from app.storage.repositories import RuntimeSettingsRepository, VkRepository, ma
 from app.vk.client import VKAPIError, VKClient
 
 logger = logging.getLogger(__name__)
+UTC = timezone.utc
 
 
 @dataclass(frozen=True)

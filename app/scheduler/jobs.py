@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.alerts.service import AlertService
 from app.collectors.telegram import LargeFloodWait, TelegramCollector
@@ -14,6 +14,7 @@ from app.storage.repositories import (
 )
 
 logger = logging.getLogger(__name__)
+UTC = timezone.utc
 
 
 class BackgroundScheduler:
