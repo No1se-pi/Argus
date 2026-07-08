@@ -8,6 +8,7 @@ from aiogram.enums import ParseMode
 from telethon import TelegramClient
 
 from app.alerts.service import AlertService
+from app.bot.access import AccessRequestService
 from app.bot.factory import create_dispatcher
 from app.collectors.telegram import TelegramCollector
 from app.config import get_settings
@@ -58,10 +59,13 @@ async def main() -> None:
         telegram_collector=collector,
     )
     telegram_auth_service = TelegramAuthService(settings)
+    access_service = AccessRequestService(settings)
 
     dispatcher = create_dispatcher(
         settings=settings,
         source_repo=repositories.sources,
+        post_repo=repositories.posts,
+        group_message_repo=repositories.group_messages,
         collector=collector,
         dashboard_service=repositories.dashboard_service(),
         scheduler_state_repo=repositories.scheduler_state,
@@ -69,6 +73,8 @@ async def main() -> None:
         vk_service=vk_service,
         runtime_settings_repo=repositories.runtime_settings,
         telegram_auth_service=telegram_auth_service,
+        keyword_repo=repositories.keywords,
+        access_service=access_service,
     )
 
     schedulers = []
@@ -81,6 +87,7 @@ async def main() -> None:
             collector=collector,
             alerts=alert_service,
             runtime_settings=repositories.runtime_settings,
+            keywords=repositories.keywords,
         )
         schedulers.append(telegram_scheduler)
         tasks.append(asyncio.create_task(telegram_scheduler.run(), name="argus-telegram-scheduler"))
@@ -92,7 +99,8 @@ async def main() -> None:
     logger.info("Argus started")
 
     try:
-        await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
+        with contextlib.suppress(asyncio.CancelledError):
+            await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
         logger.info("Argus shutdown started")
         for scheduler in schedulers:
@@ -100,10 +108,14 @@ async def main() -> None:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await bot.session.close()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await bot.session.close()
         if telegram_client is not None:
-            await telegram_client.disconnect()
-        await database.close()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await telegram_client.disconnect()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await database.close()
+        logger.info("Argus shutdown complete")
 
 
 async def _start_telegram_monitor(
@@ -156,5 +168,12 @@ async def _start_telegram_monitor(
     return telegram_client, collector
 
 
+def run() -> None:
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Argus stopped by user")
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    run()

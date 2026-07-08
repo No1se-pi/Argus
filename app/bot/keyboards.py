@@ -81,7 +81,12 @@ def telegram_menu_keyboard(available: bool) -> InlineKeyboardMarkup:
     if not available:
         return InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="⚙️ Настроить Telegram", callback_data="setup:telegram")],
+                [
+                    InlineKeyboardButton(
+                        text="⚙️ Настроить Telegram",
+                        callback_data="setup:telegram",
+                    )
+                ],
                 [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
             ]
         )
@@ -90,6 +95,10 @@ def telegram_menu_keyboard(available: bool) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="🩺 TG статус", callback_data="tg:status"),
                 InlineKeyboardButton(text="📚 Источники", callback_data="tg:sources"),
+            ],
+            [
+                InlineKeyboardButton(text="➕ Источник", callback_data="tg:add_source"),
+                InlineKeyboardButton(text="🔑 Ключи", callback_data="tg:keywords"),
             ],
             [
                 InlineKeyboardButton(text="📊 24h", callback_data="tg:dash:24h"),
@@ -128,7 +137,12 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Настроить VK", callback_data="setup:vk")],
-            [InlineKeyboardButton(text="Настроить Telegram Monitor", callback_data="setup:telegram")],
+            [
+                InlineKeyboardButton(
+                    text="Настроить Telegram Monitor",
+                    callback_data="setup:telegram",
+                )
+            ],
             [
                 InlineKeyboardButton(text="Включить VK", callback_data="vk:watch_on"),
                 InlineKeyboardButton(text="Выключить VK", callback_data="confirm:disable_vk"),
@@ -168,15 +182,73 @@ def telegram_setup_keyboard(can_auth: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def telegram_source_mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Посты канала/группы",
+                    callback_data="tg_source_mode:posts",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Комментарии / discussion-группа",
+                    callback_data="tg_source_mode:discussion",
+                )
+            ],
+            [InlineKeyboardButton(text="Отмена", callback_data="setup:cancel")],
+        ]
+    )
+
+
 def alerts_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Включить алерты VK", callback_data="alerts:vk_on")],
             [InlineKeyboardButton(text="Выключить алерты VK", callback_data="alerts:vk_off")],
-            [InlineKeyboardButton(text="Включить алерты постов", callback_data="alerts:posts_on")],
-            [InlineKeyboardButton(text="Выключить алерты постов", callback_data="alerts:posts_off")],
-            [InlineKeyboardButton(text="Включить алерты комментариев", callback_data="alerts:comments_on")],
-            [InlineKeyboardButton(text="Выключить алерты комментариев", callback_data="alerts:comments_off")],
+            [InlineKeyboardButton(text="Включить алерты TG", callback_data="alerts:tg_on")],
+            [InlineKeyboardButton(text="Выключить алерты TG", callback_data="alerts:tg_off")],
+            [InlineKeyboardButton(text="Включить VK посты", callback_data="alerts:vk_posts_on")],
+            [InlineKeyboardButton(text="Выключить VK посты", callback_data="alerts:vk_posts_off")],
+            [
+                InlineKeyboardButton(
+                    text="Включить VK комментарии",
+                    callback_data="alerts:vk_comments_on",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Выключить VK комментарии",
+                    callback_data="alerts:vk_comments_off",
+                )
+            ],
+            [InlineKeyboardButton(text="Включить TG посты", callback_data="alerts:tg_posts_on")],
+            [InlineKeyboardButton(text="Выключить TG посты", callback_data="alerts:tg_posts_off")],
+            [
+                InlineKeyboardButton(
+                    text="Включить TG комментарии",
+                    callback_data="alerts:tg_comments_on",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Выключить TG комментарии",
+                    callback_data="alerts:tg_comments_off",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Включить keyword-алерты",
+                    callback_data="alerts:keywords_on",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Выключить keyword-алерты",
+                    callback_data="alerts:keywords_off",
+                )
+            ],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")],
         ]
     )

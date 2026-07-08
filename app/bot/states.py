@@ -11,3 +11,7 @@ class TelegramAuthStates(StatesGroup):
     waiting_phone = State()
     waiting_code = State()
     waiting_password = State()
+
+
+class TelegramSourceSetupStates(StatesGroup):
+    waiting_forward = State()

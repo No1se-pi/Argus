@@ -5,13 +5,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 
-from telethon import TelegramClient, errors, types
+from telethon import TelegramClient, errors, types, utils
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.types import InputPeerChannel, InputPeerChat
 
 from app.config import Settings
 from app.scheduler.rate_limit import TelegramRateLimiter
-from app.storage.models import Post, Source
+from app.storage.models import Post, Source, TelegramGroupMessage
 from app.storage.repositories import RepositoryBundle
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,16 @@ class PostsSyncResult:
 
 
 @dataclass(frozen=True)
+class DiscussionSyncResult:
+    source_id: int
+    initialized: bool
+    fetched_count: int
+    saved_count: int
+    new_messages: list[TelegramGroupMessage]
+    last_message_id: int | None
+
+
+@dataclass(frozen=True)
 class MetricsSyncResult:
     source_id: int
     processed_posts: int
@@ -82,25 +92,37 @@ class TelegramCollector:
             ) from exc
 
         if isinstance(entity, types.Channel):
-            return ResolvedTelegramSource(
-                link=link_or_username.strip(),
-                username=entity.username,
-                title=entity.title or entity.username or str(entity.id),
-                entity_id=entity.id,
-                access_hash=entity.access_hash,
-                entity_type="channel",
-            )
+            return self._resolved_from_channel(link_or_username.strip(), entity)
 
         if isinstance(entity, types.Chat):
-            return ResolvedTelegramSource(
-                link=link_or_username.strip(),
-                username=None,
-                title=entity.title or str(entity.id),
-                entity_id=entity.id,
-                access_hash=None,
-                entity_type="chat",
-            )
+            return self._resolved_from_chat(link_or_username.strip(), entity)
 
+        raise TelegramSourceError("Поддерживаются только Telegram-каналы и группы.")
+
+    async def resolve_source_by_chat_id(
+        self,
+        chat_id: int,
+        *,
+        fallback_title: str | None = None,
+    ) -> ResolvedTelegramSource:
+        entity_id, peer_type = utils.resolve_id(chat_id)
+        peer = peer_type(entity_id)
+        try:
+            entity = await self._call_telegram(
+                "resolve forwarded source",
+                lambda: self.client.get_entity(peer),
+            )
+        except ValueError as exc:
+            raise TelegramSourceError(
+                "Не получилось получить entity из forwarded message. "
+                "User-аккаунт должен иметь доступ к этому каналу/группе."
+            ) from exc
+
+        link = str(chat_id)
+        if isinstance(entity, types.Channel):
+            return self._resolved_from_channel(link, entity, fallback_title=fallback_title)
+        if isinstance(entity, types.Chat):
+            return self._resolved_from_chat(link, entity, fallback_title=fallback_title)
         raise TelegramSourceError("Поддерживаются только Telegram-каналы и группы.")
 
     async def sync_posts(self, source: Source, limit: int | None = None) -> PostsSyncResult:
@@ -147,9 +169,70 @@ class TelegramCollector:
             last_message_id=max(max_message_id, source.last_message_id),
         )
 
-    async def sync_reactions(self, source: Source, start_iso: str, end_iso: str) -> MetricsSyncResult:
+    async def sync_discussion(
+        self,
+        source: Source,
+        limit: int | None = None,
+    ) -> DiscussionSyncResult:
+        entity = self._entity_from_source(source)
+        fetch_limit = limit or self.settings.tg_discussion_fetch_limit
+        messages = await self._call_telegram(
+            f"fetch discussion messages for source {source.id}",
+            lambda: self.client.get_messages(entity, limit=fetch_limit),
+        )
+        regular_messages = [message for message in messages if getattr(message, "id", None)]
+        if not regular_messages:
+            return DiscussionSyncResult(source.id, False, 0, 0, [], source.last_message_id)
+
+        max_message_id = max(message.id for message in regular_messages)
+        if source.last_message_id is None:
+            await self.repositories.sources.set_last_message_id(source.id, max_message_id)
+            return DiscussionSyncResult(
+                source_id=source.id,
+                initialized=True,
+                fetched_count=len(regular_messages),
+                saved_count=0,
+                new_messages=[],
+                last_message_id=max_message_id,
+            )
+
+        new_messages = sorted(
+            [message for message in regular_messages if message.id > source.last_message_id],
+            key=lambda message: message.id,
+        )
+        saved_messages: list[TelegramGroupMessage] = []
+        for message in new_messages:
+            saved, _created = await self.repositories.group_messages.upsert_message(
+                source_id=source.id,
+                telegram_message_id=message.id,
+                from_id=getattr(message, "sender_id", None),
+                date=self._message_date_iso(message),
+                text=getattr(message, "message", None),
+                message_url=self._post_url(source, message.id),
+            )
+            saved_messages.append(saved)
+
+        if max_message_id > source.last_message_id:
+            await self.repositories.sources.set_last_message_id(source.id, max_message_id)
+
+        return DiscussionSyncResult(
+            source_id=source.id,
+            initialized=False,
+            fetched_count=len(regular_messages),
+            saved_count=len(saved_messages),
+            new_messages=saved_messages,
+            last_message_id=max(max_message_id, source.last_message_id),
+        )
+
+    async def sync_reactions(
+        self,
+        source: Source,
+        start_iso: str,
+        end_iso: str,
+    ) -> MetricsSyncResult:
         posts = await self.repositories.posts.list_by_period(source.id, start_iso, end_iso)
-        posts = posts[-self.settings.reactions_sync_limit :]
+        tracked_limit = source.tracked_posts_limit or self.settings.tg_tracked_posts_limit
+        posts = posts[-tracked_limit:]
         if not posts:
             return MetricsSyncResult(source.id, processed_posts=0, saved_items=0)
 
@@ -187,7 +270,12 @@ class TelegramCollector:
 
         return MetricsSyncResult(source.id, processed_posts=len(posts), saved_items=saved)
 
-    async def sync_comments(self, source: Source, start_iso: str, end_iso: str) -> MetricsSyncResult:
+    async def sync_comments(
+        self,
+        source: Source,
+        start_iso: str,
+        end_iso: str,
+    ) -> MetricsSyncResult:
         posts = await self.repositories.posts.list_by_period(source.id, start_iso, end_iso)
         if not posts:
             return MetricsSyncResult(source.id, processed_posts=0, saved_items=0)
@@ -223,7 +311,9 @@ class TelegramCollector:
     async def join_source(self, source: Source) -> None:
         entity = self._entity_from_source(source)
         if source.telegram_entity_type != "channel":
-            raise TelegramSourceError("Join поддерживается только для публичных каналов/супергрупп.")
+            raise TelegramSourceError(
+                "Join поддерживается только для публичных каналов/супергрупп."
+            )
         await self._call_telegram(
             f"join source {source.id}",
             lambda: self.client(JoinChannelRequest(entity)),
@@ -323,6 +413,38 @@ class TelegramCollector:
         if source.username:
             return source.username
         return source.link
+
+    def _resolved_from_channel(
+        self,
+        link: str,
+        entity: types.Channel,
+        *,
+        fallback_title: str | None = None,
+    ) -> ResolvedTelegramSource:
+        return ResolvedTelegramSource(
+            link=link,
+            username=entity.username,
+            title=entity.title or fallback_title or entity.username or str(entity.id),
+            entity_id=entity.id,
+            access_hash=entity.access_hash,
+            entity_type="channel",
+        )
+
+    def _resolved_from_chat(
+        self,
+        link: str,
+        entity: types.Chat,
+        *,
+        fallback_title: str | None = None,
+    ) -> ResolvedTelegramSource:
+        return ResolvedTelegramSource(
+            link=link,
+            username=None,
+            title=entity.title or fallback_title or str(entity.id),
+            entity_id=entity.id,
+            access_hash=None,
+            entity_type="chat",
+        )
 
     def _normalize_reference(self, value: str) -> str:
         reference = value.strip()

@@ -1,11 +1,14 @@
 import contextlib
 import logging
+from html import escape
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from app.analytics.dashboard import DashboardService
+from app.bot.access import AccessRequestService
 from app.bot.keyboards import (
     alerts_keyboard,
     confirm_keyboard,
@@ -20,6 +23,7 @@ from app.bot.keyboards import (
     vk_menu_keyboard,
     vk_setup_keyboard,
 )
+from app.bot.messages import answer_dashboard
 from app.bot.screens import (
     main_menu_text,
     modules_text,
@@ -28,10 +32,14 @@ from app.bot.screens import (
     telegram_auth_cli_text,
     unavailable_text,
 )
-from app.bot.states import TelegramAuthStates, VKSetupStates
+from app.bot.states import TelegramAuthStates, TelegramSourceSetupStates, VKSetupStates
 from app.config import Settings
 from app.modules import ModuleRegistry, ModuleStatus
-from app.storage.repositories import RuntimeSettingsRepository, SourceRepository
+from app.storage.repositories import (
+    RuntimeSettingsRepository,
+    SourceRepository,
+    TelegramKeywordRepository,
+)
 from app.telegram_auth import TelegramAuthService
 from app.vk.service import VKService
 
@@ -42,6 +50,43 @@ router = Router(name="callbacks")
 @router.callback_query(F.data == "menu:main")
 async def main_menu_callback(query: CallbackQuery, module_registry: ModuleRegistry) -> None:
     await _edit(query, await main_menu_text(module_registry), main_menu_keyboard())
+
+
+@router.callback_query(F.data.startswith("access:approve:"))
+async def access_approve_callback(
+    query: CallbackQuery,
+    access_service: AccessRequestService,
+) -> None:
+    user_id = _callback_int_tail(query.data)
+    if user_id is None:
+        await query.answer("Некорректный ID.", show_alert=True)
+        return
+    try:
+        added = access_service.approve(user_id)
+    except Exception as exc:
+        logger.exception("Failed to approve bot access")
+        await query.answer(f"Не удалось обновить .env: {_safe_error(exc)}", show_alert=True)
+        return
+
+    status = "выдан" if added else "уже был выдан"
+    await _edit(query, f"Доступ {status}: <code>{user_id}</code>")
+    with contextlib.suppress(Exception):
+        await query.bot.send_message(user_id, "Доступ к Argus выдан. Нажми /start.")
+
+
+@router.callback_query(F.data.startswith("access:deny:"))
+async def access_deny_callback(
+    query: CallbackQuery,
+    access_service: AccessRequestService,
+) -> None:
+    user_id = _callback_int_tail(query.data)
+    if user_id is None:
+        await query.answer("Некорректный ID.", show_alert=True)
+        return
+    access_service.deny(user_id)
+    await _edit(query, f"Заявка отклонена: <code>{user_id}</code>")
+    with contextlib.suppress(Exception):
+        await query.bot.send_message(user_id, "Заявка на доступ к Argus отклонена.")
 
 
 @router.callback_query(F.data == "menu:status")
@@ -142,11 +187,21 @@ async def vk_comments_callback(query: CallbackQuery, vk_service: VKService) -> N
 @router.callback_query(F.data.startswith("vk:dash:"))
 async def vk_dashboard_callback(query: CallbackQuery, vk_service: VKService) -> None:
     period = (query.data or "").split(":")[-1]
+    chart_png = None
     try:
         text = await vk_service.render_dashboard(period)
+        chart_png = await vk_service.render_dashboard_chart_png(period)
     except Exception as exc:
         text = f"VK dashboard unavailable: {_safe_error(exc)}"
-    await _edit(query, text, vk_menu_keyboard(True))
+    await query.answer()
+    if query.message is not None:
+        await answer_dashboard(
+            query.message,
+            text=text,
+            chart_png=chart_png,
+            filename=f"argus_vk_dashboard_{period}.png",
+            reply_markup=vk_menu_keyboard(True),
+        )
 
 
 @router.callback_query(F.data == "tg:status")
@@ -170,28 +225,171 @@ async def tg_sources_callback(
     if not sources:
         await _edit(
             query,
-            "Telegram sources: no data. Use /add_source <username>.",
+            "Telegram sources: no data. Use /add_source &lt;username&gt;.",
             telegram_menu_keyboard(True),
         )
         return
     lines = ["<b>Telegram sources</b>"]
-    lines.extend(f"#{source.id} {source.display_name}" for source in sources)
+    for source in sources:
+        telegram_id = source.telegram_reference_id or "unknown"
+        lines.append(
+            f"#{source.id} {escape(source.display_name)}\n"
+            f"  telegram_id: {telegram_id}, mode: {escape(source.telegram_monitor_mode)}"
+        )
     await _edit(query, "\n".join(lines), telegram_menu_keyboard(True))
 
 
+@router.callback_query(F.data == "tg:add_source")
+async def tg_add_source_callback(
+    query: CallbackQuery,
+    state: FSMContext,
+    module_registry: ModuleRegistry,
+) -> None:
+    info = await module_registry.telegram_info()
+    if not info.is_available:
+        await _edit(query, unavailable_text(info), telegram_menu_keyboard(False))
+        return
+    await state.clear()
+    await state.set_state(TelegramSourceSetupStates.waiting_forward)
+    await _edit(
+        query,
+        "Перешли сюда сообщение из канала или discussion-группы. "
+        "После этого выберем режим мониторинга.",
+        setup_cancel_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "tg:keywords")
+async def tg_keywords_callback(
+    query: CallbackQuery,
+    keyword_repo: TelegramKeywordRepository,
+) -> None:
+    keywords = await keyword_repo.list_keywords()
+    if not keywords:
+        await _edit(
+            query,
+            "Ключевых слов пока нет. Добавь командой /tg_add_keyword &lt;text&gt;.",
+            telegram_menu_keyboard(True),
+        )
+        return
+    lines = ["<b>Telegram keywords</b>"]
+    lines.extend(f"#{keyword.id} {escape(keyword.keyword)}" for keyword in keywords)
+    await _edit(query, "\n".join(lines), telegram_menu_keyboard(True))
+
+
+@router.callback_query(F.data.startswith("tg_source_mode:"))
+async def tg_source_mode_callback(
+    query: CallbackQuery,
+    state: FSMContext,
+    source_repo: SourceRepository,
+) -> None:
+    mode = (query.data or "").split(":", maxsplit=1)[-1]
+    if mode not in {"posts", "discussion"}:
+        await query.answer("Неизвестный режим источника.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    required = {"link", "title", "entity_id", "entity_type"}
+    if not required.issubset(data):
+        await state.clear()
+        await _edit(
+            query,
+            "Источник не найден. Повтори /tg_add_source.",
+            telegram_menu_keyboard(True),
+        )
+        return
+
+    source = await source_repo.upsert_telegram_source(
+        link=str(data["link"]),
+        username=data.get("username"),
+        title=str(data["title"]),
+        entity_id=int(data["entity_id"]),
+        access_hash=data.get("access_hash"),
+        entity_type=str(data["entity_type"]),
+        monitor_mode=mode,
+    )
+    await state.clear()
+    await _edit(
+        query,
+        "\n".join(
+            [
+                "Источник добавлен.",
+                f"ID: {source.id}",
+                f"Название: {escape(source.display_name)}",
+                f"Режим: {source.telegram_monitor_mode}",
+                "Первый sync сохранит baseline и не пришлёт старые алерты.",
+            ]
+        ),
+        telegram_menu_keyboard(True),
+    )
+
+
 @router.callback_query(F.data.startswith("tg:dash:"))
-async def tg_dashboard_callback(query: CallbackQuery, module_registry: ModuleRegistry) -> None:
+async def tg_dashboard_callback(
+    query: CallbackQuery,
+    module_registry: ModuleRegistry,
+    source_repo: SourceRepository,
+) -> None:
     info = await module_registry.telegram_info()
     if not info.is_available:
         await _edit(query, unavailable_text(info), telegram_menu_keyboard(False))
         return
     period = (query.data or "").split(":")[-1]
+    sources = await source_repo.list_sources()
+    if not sources:
+        await _edit(
+            query,
+            "Telegram dashboard: источников пока нет. Добавь источник через /tg_add_source.",
+            telegram_menu_keyboard(True),
+        )
+        return
+
+    lines = [f"<b>Telegram dashboard за {escape(period)}</b>", "", "Выбери источник:"]
+    for source in sources:
+        telegram_id = source.telegram_reference_id or "unknown"
+        lines.append(
+            f"#{source.id} {escape(source.display_name)}\n"
+            f"  telegram_id: {telegram_id}, mode: {escape(source.telegram_monitor_mode)}"
+        )
     await _edit(
         query,
-        f"Telegram dashboard за {period}: "
-        f"выбери source_id командой /tg_dashboard <source_id> {period}.",
-        telegram_menu_keyboard(True),
+        "\n".join(lines),
+        _tg_dashboard_sources_keyboard(sources, period),
     )
+
+
+@router.callback_query(F.data.startswith("tg:dashsrc:"))
+async def tg_dashboard_source_callback(
+    query: CallbackQuery,
+    dashboard_service: DashboardService,
+) -> None:
+    parts = (query.data or "").split(":")
+    if len(parts) != 4:
+        await query.answer("Некорректный выбор дашборда.", show_alert=True)
+        return
+    period = parts[2]
+    try:
+        source_id = int(parts[3])
+    except ValueError:
+        await query.answer("Некорректный ID источника.", show_alert=True)
+        return
+    chart_png = None
+    try:
+        text = await dashboard_service.render(source_id, period)
+        chart_png = await dashboard_service.render_chart_png(source_id, period)
+    except Exception as exc:
+        await _edit(query, f"Telegram dashboard unavailable: {_safe_error(exc)}", telegram_menu_keyboard(True))
+        return
+
+    await query.answer()
+    if query.message is not None:
+        await answer_dashboard(
+            query.message,
+            text=text,
+            chart_png=chart_png,
+            filename=f"argus_tg_dashboard_{source_id}_{period}.png",
+            reply_markup=telegram_menu_keyboard(True),
+        )
 
 
 @router.callback_query(F.data == "vk:watch_on")
@@ -248,7 +446,7 @@ async def telegram_setup_callback(query: CallbackQuery, module_registry: ModuleR
         "<b>Telegram Monitor setup</b>",
         "",
         f"Status: {info.status.value}",
-        f"Reason: {info.reason or 'ok'}",
+        f"Reason: {escape(info.reason or 'ok')}",
         "",
         "Если TG_API_ID/TG_API_HASH пока нет, Bot UI всё равно работает.",
         "Telethon session создаётся локально, не через бота.",
@@ -416,10 +614,22 @@ async def alerts_toggle_callback(
     mapping = {
         "alerts:vk_on": ("alerts_vk_enabled", True),
         "alerts:vk_off": ("alerts_vk_enabled", False),
+        "alerts:tg_on": ("alerts_telegram_enabled", True),
+        "alerts:tg_off": ("alerts_telegram_enabled", False),
         "alerts:posts_on": ("alerts_vk_posts_enabled", True),
         "alerts:posts_off": ("alerts_vk_posts_enabled", False),
         "alerts:comments_on": ("alerts_vk_comments_enabled", True),
         "alerts:comments_off": ("alerts_vk_comments_enabled", False),
+        "alerts:vk_posts_on": ("alerts_vk_posts_enabled", True),
+        "alerts:vk_posts_off": ("alerts_vk_posts_enabled", False),
+        "alerts:vk_comments_on": ("alerts_vk_comments_enabled", True),
+        "alerts:vk_comments_off": ("alerts_vk_comments_enabled", False),
+        "alerts:tg_posts_on": ("alerts_telegram_posts_enabled", True),
+        "alerts:tg_posts_off": ("alerts_telegram_posts_enabled", False),
+        "alerts:tg_comments_on": ("alerts_telegram_comments_enabled", True),
+        "alerts:tg_comments_off": ("alerts_telegram_comments_enabled", False),
+        "alerts:keywords_on": ("alerts_telegram_keywords_enabled", True),
+        "alerts:keywords_off": ("alerts_telegram_keywords_enabled", False),
     }
     key, enabled = mapping.get(query.data, ("", True))
     if not key:
@@ -427,6 +637,34 @@ async def alerts_toggle_callback(
         return
     await runtime_settings_repo.set(key, "true" if enabled else "false", is_secret=False)
     await _edit(query, await _alerts_text(runtime_settings_repo, settings), alerts_keyboard())
+
+
+def _tg_dashboard_sources_keyboard(sources, period: str) -> InlineKeyboardMarkup:
+    rows = []
+    for source in sources[:20]:
+        title = source.display_name
+        if len(title) > 28:
+            title = f"{title[:25]}..."
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"#{source.id} {title}",
+                    callback_data=f"tg:dashsrc:{period}:{source.id}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="Назад в Telegram", callback_data="tg:menu")])
+    rows.append([InlineKeyboardButton(text="Главное меню", callback_data="menu:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _callback_int_tail(data: str | None) -> int | None:
+    if not data:
+        return None
+    try:
+        return int(data.rsplit(":", maxsplit=1)[-1])
+    except ValueError:
+        return None
 
 
 async def _edit(query: CallbackQuery, text: str, reply_markup=None) -> None:
@@ -448,8 +686,8 @@ async def _edit(query: CallbackQuery, text: str, reply_markup=None) -> None:
 def _safe_error(exc: Exception) -> str:
     text = str(exc)
     if len(text) > 300:
-        return f"{text[:297]}..."
-    return text
+        text = f"{text[:297]}..."
+    return escape(text)
 
 
 async def _alerts_text(runtime_settings_repo: RuntimeSettingsRepository, settings: Settings) -> str:
@@ -457,21 +695,42 @@ async def _alerts_text(runtime_settings_repo: RuntimeSettingsRepository, setting
         "alerts_vk_enabled",
         settings.alerts_vk_enabled,
     )
-    posts_enabled = await runtime_settings_repo.get_bool(
+    vk_posts_enabled = await runtime_settings_repo.get_bool(
         "alerts_vk_posts_enabled",
         settings.alerts_vk_posts_enabled,
     )
-    comments_enabled = await runtime_settings_repo.get_bool(
+    vk_comments_enabled = await runtime_settings_repo.get_bool(
         "alerts_vk_comments_enabled",
         settings.alerts_vk_comments_enabled,
+    )
+    tg_enabled = await runtime_settings_repo.get_bool(
+        "alerts_telegram_enabled",
+        settings.alerts_telegram_enabled,
+    )
+    tg_posts_enabled = await runtime_settings_repo.get_bool(
+        "alerts_telegram_posts_enabled",
+        settings.alerts_telegram_posts_enabled,
+    )
+    tg_comments_enabled = await runtime_settings_repo.get_bool(
+        "alerts_telegram_comments_enabled",
+        settings.alerts_telegram_comments_enabled,
+    )
+    tg_keywords_enabled = await runtime_settings_repo.get_bool(
+        "alerts_telegram_keywords_enabled",
+        settings.alerts_telegram_keywords_enabled,
     )
     return "\n".join(
         [
             "<b>Алерты</b>",
             "",
             f"VK alerts: {_flag(vk_enabled)}",
-            f"Новые посты: {_flag(posts_enabled)}",
-            f"Новые комментарии: {_flag(comments_enabled)}",
+            f"VK новые посты: {_flag(vk_posts_enabled)}",
+            f"VK новые комментарии: {_flag(vk_comments_enabled)}",
+            "",
+            f"TG alerts: {_flag(tg_enabled)}",
+            f"TG новые посты: {_flag(tg_posts_enabled)}",
+            f"TG новые комментарии: {_flag(tg_comments_enabled)}",
+            f"TG keyword posts: {_flag(tg_keywords_enabled)}",
             "",
             "Выбери, что включить или выключить:",
         ]

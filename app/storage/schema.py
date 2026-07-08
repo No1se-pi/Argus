@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS sources (
     telegram_entity_id INTEGER,
     telegram_access_hash INTEGER,
     telegram_entity_type TEXT,
+    telegram_monitor_mode TEXT NOT NULL DEFAULT 'posts',
+    tracked_posts_limit INTEGER,
     last_message_id INTEGER,
     is_active INTEGER NOT NULL DEFAULT 1,
     last_error TEXT,
@@ -60,6 +62,32 @@ CREATE TABLE IF NOT EXISTS comments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_comments_source_date ON comments(source_id, date);
+
+CREATE TABLE IF NOT EXISTS telegram_group_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    telegram_message_id INTEGER NOT NULL,
+    from_id INTEGER,
+    date TEXT NOT NULL,
+    text TEXT,
+    message_url TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(source_id, telegram_message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tg_group_messages_source_date
+ON telegram_group_messages(source_id, date);
+
+CREATE TABLE IF NOT EXISTS telegram_keywords (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword TEXT NOT NULL UNIQUE,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tg_keywords_active ON telegram_keywords(is_active);
 
 CREATE TABLE IF NOT EXISTS stats_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -172,8 +200,25 @@ ON vk_stats_snapshots(group_id, checked_at);
 async def init_schema(database: Database) -> None:
     connection = database.require_connection()
     await connection.executescript(SCHEMA_SQL)
+    await _ensure_source_columns(database)
     await _ensure_alert_columns(database)
     await connection.commit()
+
+
+async def _ensure_source_columns(database: Database) -> None:
+    connection = database.require_connection()
+    async with connection.execute("PRAGMA table_info(sources)") as cursor:
+        rows = await cursor.fetchall()
+    columns = {row["name"] for row in rows}
+    migrations = []
+    if "telegram_monitor_mode" not in columns:
+        migrations.append(
+            "ALTER TABLE sources ADD COLUMN telegram_monitor_mode TEXT NOT NULL DEFAULT 'posts'"
+        )
+    if "tracked_posts_limit" not in columns:
+        migrations.append("ALTER TABLE sources ADD COLUMN tracked_posts_limit INTEGER")
+    for statement in migrations:
+        await connection.execute(statement)
 
 
 async def _ensure_alert_columns(database: Database) -> None:

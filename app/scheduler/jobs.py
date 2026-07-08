@@ -6,7 +6,12 @@ from app.alerts.service import AlertService
 from app.collectors.telegram import LargeFloodWait, TelegramCollector
 from app.config import Settings
 from app.storage.models import Source
-from app.storage.repositories import RuntimeSettingsRepository, SchedulerStateRepository, SourceRepository
+from app.storage.repositories import (
+    RuntimeSettingsRepository,
+    SchedulerStateRepository,
+    SourceRepository,
+    TelegramKeywordRepository,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +26,7 @@ class BackgroundScheduler:
         collector: TelegramCollector,
         alerts: AlertService,
         runtime_settings: RuntimeSettingsRepository | None = None,
+        keywords: TelegramKeywordRepository | None = None,
     ) -> None:
         self.settings = settings
         self.sources = sources
@@ -28,6 +34,7 @@ class BackgroundScheduler:
         self.collector = collector
         self.alerts = alerts
         self.runtime_settings = runtime_settings
+        self.keywords = keywords
         self._stop_event = asyncio.Event()
 
     def stop(self) -> None:
@@ -56,35 +63,65 @@ class BackgroundScheduler:
 
         active_sources = await self.sources.list_sources()
         for source in active_sources:
-            if await self._is_deferred(source):
-                continue
-
             try:
-                result = await self.collector.sync_posts(source)
-                fresh_source = await self.sources.get_source(source.id) or source
-                for post in result.new_posts:
-                    await self.alerts.send_new_post_alert(fresh_source, post)
+                if source.telegram_monitor_mode == "discussion":
+                    await self._sync_discussion_source(source)
+                else:
+                    await self._sync_post_source(source)
+                    await self._sync_reactions_if_due(source)
                 await self.sources.clear_error(source.id)
             except LargeFloodWait as exc:
-                next_at = datetime.now(UTC) + timedelta(seconds=exc.seconds)
-                await self.scheduler_state.set(self._defer_key(source.id), next_at.isoformat())
-                await self.sources.set_error(
-                    source.id,
-                    f"FloodWait {exc.seconds}s during {exc.operation}",
-                )
-                logger.warning(
-                    "Deferred source %s for %s seconds after FloodWait",
-                    source.id,
-                    exc.seconds,
-                )
+                await self._defer_after_flood(source, exc)
             except Exception as exc:
                 await self.sources.set_error(source.id, str(exc))
                 logger.exception("Failed to synchronize source %s", source.id)
 
             await asyncio.sleep(self.settings.source_sync_pause_seconds)
 
-    async def _is_deferred(self, source: Source) -> bool:
-        raw_value = await self.scheduler_state.get(self._defer_key(source.id))
+    async def _sync_post_source(self, source: Source) -> None:
+        if await self._is_deferred(self._defer_key(source.id, "posts")):
+            return
+        result = await self.collector.sync_posts(source)
+        fresh_source = await self.sources.get_source(source.id) or source
+        for post in result.new_posts:
+            await self.alerts.send_new_post_alert(fresh_source, post)
+            if self.keywords is None:
+                continue
+            matched_keywords = await self.keywords.matching_keywords(post.text)
+            if matched_keywords:
+                await self.alerts.send_keyword_post_alert(fresh_source, post, matched_keywords)
+
+    async def _sync_discussion_source(self, source: Source) -> None:
+        if await self._is_deferred(self._defer_key(source.id, "discussion")):
+            return
+        result = await self.collector.sync_discussion(source)
+        if result.initialized or not result.new_messages:
+            return
+        fresh_source = await self.sources.get_source(source.id) or source
+        alert_limit = self.settings.tg_comment_alerts_per_cycle
+        for message in result.new_messages[:alert_limit]:
+            await self.alerts.send_telegram_comment_alert(fresh_source, message)
+        if len(result.new_messages) > alert_limit:
+            await self.alerts.send_telegram_comment_summary(
+                fresh_source,
+                total_count=len(result.new_messages),
+                sent_count=alert_limit,
+            )
+
+    async def _sync_reactions_if_due(self, source: Source) -> None:
+        due_key = self._reactions_due_key(source.id)
+        if await self._is_deferred(self._defer_key(source.id, "reactions")):
+            return
+        if await self._is_deferred(due_key):
+            return
+        now = datetime.now(UTC)
+        start = (now - timedelta(days=30)).isoformat()
+        await self.collector.sync_reactions(source, start, now.isoformat())
+        next_at = now + timedelta(seconds=self.settings.tg_reactions_sync_interval_seconds)
+        await self.scheduler_state.set(due_key, next_at.isoformat())
+
+    async def _is_deferred(self, key: str) -> bool:
+        raw_value = await self.scheduler_state.get(key)
         if not raw_value:
             return False
         try:
@@ -93,8 +130,34 @@ class BackgroundScheduler:
             return False
         return next_at > datetime.now(UTC)
 
-    def _defer_key(self, source_id: int) -> str:
-        return f"telegram:source:{source_id}:next_posts_sync_after"
+    async def _defer_after_flood(self, source: Source, exc: LargeFloodWait) -> None:
+        operation = self._operation_from_flood(exc)
+        next_at = datetime.now(UTC) + timedelta(seconds=exc.seconds)
+        await self.scheduler_state.set(self._defer_key(source.id, operation), next_at.isoformat())
+        await self.sources.set_error(
+            source.id,
+            f"FloodWait {exc.seconds}s during {exc.operation}",
+        )
+        logger.warning(
+            "Deferred source %s operation %s for %s seconds after FloodWait",
+            source.id,
+            operation,
+            exc.seconds,
+        )
+
+    def _defer_key(self, source_id: int, operation: str) -> str:
+        return f"telegram:source:{source_id}:next_{operation}_sync_after"
+
+    def _reactions_due_key(self, source_id: int) -> str:
+        return f"telegram:source:{source_id}:next_reactions_due_after"
+
+    def _operation_from_flood(self, exc: LargeFloodWait) -> str:
+        operation = exc.operation.lower()
+        if "reaction" in operation:
+            return "reactions"
+        if "discussion" in operation or "comment" in operation:
+            return "discussion"
+        return "posts"
 
     async def _telegram_monitor_enabled(self) -> bool:
         if self.runtime_settings is None:

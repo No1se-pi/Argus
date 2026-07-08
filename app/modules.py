@@ -59,6 +59,7 @@ class ModuleRegistry:
             "/vk_status",
             "/vk_setup",
             "/vk_recent_posts",
+            "/vk_posts",
             "/vk_recent_comments",
             "/vk_sync",
             "/vk_dashboard",
@@ -92,7 +93,13 @@ class ModuleRegistry:
         )
         commands = [
             "/tg_status",
+            "/tg_add_source",
             "/tg_sources",
+            "/tg_keywords",
+            "/tg_add_keyword",
+            "/tg_remove_keyword",
+            "/tg_recent_posts",
+            "/tg_posts",
             "/tg_dashboard",
             "/tg_sync_posts",
             "/add_source",
@@ -136,7 +143,10 @@ class ModuleRegistry:
                 name="Telegram Monitor",
                 enabled=True,
                 status=ModuleStatus.AUTH_REQUIRED,
-                reason="Telethon session exists but user is not authorized or client failed to start",
+                reason=(
+                    "Telethon session exists but user is not authorized "
+                    "or client failed to start"
+                ),
                 available_commands=[],
             )
 
@@ -170,7 +180,7 @@ class ModuleRegistry:
         return RuntimeMode.CONTROL_ONLY
 
     async def available_commands(self) -> list[str]:
-        commands = ["/start", "/menu", "/help", "/status", "/modules", "/setup"]
+        commands = ["/start", "/request_access", "/menu", "/help", "/status", "/modules", "/setup"]
         for module in await self.module_infos(check_network=False):
             commands.extend(module.available_commands)
         return sorted(set(commands))
@@ -187,11 +197,24 @@ class ModuleRegistry:
                         "/vk_dashboard",
                         "/vk_recent_comments",
                         "/vk_recent_posts",
+                        "/vk_posts",
                         "/vk_sync",
                     ]
                 )
             if module.name == "Telegram Monitor":
-                disabled.extend(["/tg_sources", "/tg_dashboard", "/tg_sync_posts"])
+                disabled.extend(
+                    [
+                        "/tg_add_source",
+                        "/tg_sources",
+                        "/tg_keywords",
+                        "/tg_add_keyword",
+                        "/tg_remove_keyword",
+                        "/tg_recent_posts",
+                        "/tg_posts",
+                        "/tg_dashboard",
+                        "/tg_sync_posts",
+                    ]
+                )
         return sorted(set(disabled))
 
     async def set_module_enabled(self, key: str, enabled: bool) -> None:

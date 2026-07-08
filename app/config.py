@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     alerts_vk_enabled: bool = True
     alerts_vk_posts_enabled: bool = True
     alerts_vk_comments_enabled: bool = True
+    alerts_telegram_enabled: bool = True
+    alerts_telegram_posts_enabled: bool = True
+    alerts_telegram_comments_enabled: bool = True
+    alerts_telegram_keywords_enabled: bool = True
 
     poll_interval_seconds: int = 60
     source_sync_pause_seconds: float = 2.0
@@ -61,6 +65,10 @@ class Settings(BaseSettings):
     initial_bootstrap_limit: int = 1
     comments_limit_per_post: int = 100
     reactions_sync_limit: int = 50
+    tg_discussion_fetch_limit: int = 20
+    tg_tracked_posts_limit: int = 20
+    tg_comment_alerts_per_cycle: int = 10
+    tg_reactions_sync_interval_seconds: int = 1800
     flood_wait_small_seconds: int = 60
     log_level: str = "INFO"
 
@@ -71,7 +79,13 @@ class Settings(BaseSettings):
             return None
         return int(value)  # type: ignore[arg-type]
 
-    @field_validator("vk_access_token", "vk_group_token", "vk_user_access_token", "tg_api_hash", mode="before")
+    @field_validator(
+        "vk_access_token",
+        "vk_group_token",
+        "vk_user_access_token",
+        "tg_api_hash",
+        mode="before",
+    )
     @classmethod
     def parse_optional_secret(cls, value: object) -> object | None:
         if value is None or value == "":

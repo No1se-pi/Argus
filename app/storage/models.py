@@ -13,6 +13,8 @@ class Source:
     telegram_entity_id: int | None
     telegram_access_hash: int | None
     telegram_entity_type: str | None
+    telegram_monitor_mode: str
+    tracked_posts_limit: int | None
     last_message_id: int | None
     is_active: bool
     last_error: str | None
@@ -30,6 +32,8 @@ class Source:
             telegram_entity_id=row["telegram_entity_id"],
             telegram_access_hash=row["telegram_access_hash"],
             telegram_entity_type=row["telegram_entity_type"],
+            telegram_monitor_mode=row["telegram_monitor_mode"],
+            tracked_posts_limit=row["tracked_posts_limit"],
             last_message_id=row["last_message_id"],
             is_active=bool(row["is_active"]),
             last_error=row["last_error"],
@@ -44,6 +48,14 @@ class Source:
         if self.username:
             return f"@{self.username}"
         return self.link
+
+    @property
+    def telegram_reference_id(self) -> int | None:
+        if self.telegram_entity_id is None:
+            return None
+        if self.telegram_entity_type == "channel":
+            return -(1_000_000_000_000 + abs(self.telegram_entity_id))
+        return self.telegram_entity_id
 
 
 @dataclass(frozen=True)
@@ -99,6 +111,52 @@ class Comment:
             from_id=row["from_id"],
             date=row["date"],
             text=row["text"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass(frozen=True)
+class TelegramGroupMessage:
+    id: int
+    source_id: int
+    telegram_message_id: int
+    from_id: int | None
+    date: str
+    text: str | None
+    message_url: str | None
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: Row) -> "TelegramGroupMessage":
+        return cls(
+            id=row["id"],
+            source_id=row["source_id"],
+            telegram_message_id=row["telegram_message_id"],
+            from_id=row["from_id"],
+            date=row["date"],
+            text=row["text"],
+            message_url=row["message_url"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass(frozen=True)
+class TelegramKeyword:
+    id: int
+    keyword: str
+    is_active: bool
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: Row) -> "TelegramKeyword":
+        return cls(
+            id=row["id"],
+            keyword=row["keyword"],
+            is_active=bool(row["is_active"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

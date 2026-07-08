@@ -10,6 +10,7 @@ dependencies = [
     "aiosqlite>=0.19,<1",
     "pydantic-settings>=2.2,<3",
     "Telethon>=1.34,<2",
+    "matplotlib>=3.8,<4",
 ]
 
 [tool.setuptools.packages.find]

@@ -2,31 +2,62 @@ from datetime import UTC, datetime
 
 from app.analytics.dashboard import DashboardService
 from app.storage.database import Database
-from app.storage.models import Comment, Post, Source, VkComment, VkPost, VkSource
+from app.storage.models import (
+    Comment,
+    Post,
+    Source,
+    TelegramGroupMessage,
+    TelegramKeyword,
+    VkComment,
+    VkPost,
+    VkSource,
+)
 
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _telegram_entity_id_candidates(value: int) -> list[int]:
+    candidates = {value, abs(value), -value}
+    absolute = abs(value)
+    channel_offset = 1_000_000_000_000
+    if absolute > channel_offset:
+        candidates.add(absolute - channel_offset)
+        candidates.add(-(absolute - channel_offset))
+    return sorted(candidates)
+
+
 class SourceRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    async def list_sources(self, include_inactive: bool = False) -> list[Source]:
+    async def list_sources(
+        self,
+        include_inactive: bool = False,
+        monitor_mode: str | None = None,
+    ) -> list[Source]:
         connection = self.database.require_connection()
         query = "SELECT * FROM sources"
-        params: tuple[object, ...] = ()
+        conditions = []
+        params: list[object] = []
         if not include_inactive:
-            query += " WHERE is_active = 1"
+            conditions.append("is_active = 1")
+        if monitor_mode is not None:
+            conditions.append("telegram_monitor_mode = ?")
+            params.append(monitor_mode)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY id"
-        async with connection.execute(query, params) as cursor:
+        async with connection.execute(query, tuple(params)) as cursor:
             rows = await cursor.fetchall()
         return [Source.from_row(row) for row in rows]
 
     async def count_active(self) -> int:
         connection = self.database.require_connection()
-        async with connection.execute("SELECT COUNT(*) AS count FROM sources WHERE is_active = 1") as cursor:
+        async with connection.execute(
+            "SELECT COUNT(*) AS count FROM sources WHERE is_active = 1"
+        ) as cursor:
             row = await cursor.fetchone()
         return int(row["count"])
 
@@ -45,6 +76,22 @@ class SourceRepository:
             row = await cursor.fetchone()
         return Source.from_row(row) if row else None
 
+    async def get_by_telegram_reference(self, value: int) -> Source | None:
+        candidates = _telegram_entity_id_candidates(value)
+        connection = self.database.require_connection()
+        placeholders = ", ".join("?" for _item in candidates)
+        async with connection.execute(
+            f"""
+            SELECT * FROM sources
+            WHERE kind = 'telegram' AND telegram_entity_id IN ({placeholders})
+            ORDER BY is_active DESC, id ASC
+            LIMIT 1
+            """,
+            tuple(candidates),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return Source.from_row(row) if row else None
+
     async def upsert_telegram_source(
         self,
         *,
@@ -54,6 +101,8 @@ class SourceRepository:
         entity_id: int,
         access_hash: int | None,
         entity_type: str,
+        monitor_mode: str = "posts",
+        tracked_posts_limit: int | None = None,
     ) -> Source:
         connection = self.database.require_connection()
         now = utc_now_iso()
@@ -63,10 +112,27 @@ class SourceRepository:
                 """
                 UPDATE sources
                 SET link = ?, username = ?, title = ?, telegram_access_hash = ?,
-                    telegram_entity_type = ?, is_active = 1, last_error = NULL, updated_at = ?
+                    telegram_entity_type = ?, telegram_monitor_mode = ?,
+                    tracked_posts_limit = COALESCE(?, tracked_posts_limit),
+                    last_message_id = CASE
+                        WHEN telegram_monitor_mode != ? THEN NULL
+                        ELSE last_message_id
+                    END,
+                    is_active = 1, last_error = NULL, updated_at = ?
                 WHERE id = ?
                 """,
-                (link, username, title, access_hash, entity_type, now, existing.id),
+                (
+                    link,
+                    username,
+                    title,
+                    access_hash,
+                    entity_type,
+                    monitor_mode,
+                    tracked_posts_limit,
+                    monitor_mode,
+                    now,
+                    existing.id,
+                ),
             )
             await connection.commit()
             source = await self.get_source(existing.id)
@@ -78,11 +144,23 @@ class SourceRepository:
             """
             INSERT INTO sources (
                 kind, link, username, title, telegram_entity_id, telegram_access_hash,
-                telegram_entity_type, is_active, created_at, updated_at
+                telegram_entity_type, telegram_monitor_mode, tracked_posts_limit,
+                is_active, created_at, updated_at
             )
-            VALUES ('telegram', ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            VALUES ('telegram', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             """,
-            (link, username, title, entity_id, access_hash, entity_type, now, now),
+            (
+                link,
+                username,
+                title,
+                entity_id,
+                access_hash,
+                entity_type,
+                monitor_mode,
+                tracked_posts_limit,
+                now,
+                now,
+            ),
         )
         await connection.commit()
         source = await self.get_source(cursor.lastrowid)
@@ -120,6 +198,35 @@ class SourceRepository:
         await connection.execute(
             "UPDATE sources SET last_error = NULL, updated_at = ? WHERE id = ?",
             (utc_now_iso(), source_id),
+        )
+        await connection.commit()
+
+    async def update_monitor_settings(
+        self,
+        source_id: int,
+        *,
+        monitor_mode: str | None = None,
+        tracked_posts_limit: int | None = None,
+    ) -> None:
+        assignments = ["updated_at = ?"]
+        params: list[object] = [utc_now_iso()]
+        if monitor_mode is not None:
+            assignments.append("telegram_monitor_mode = ?")
+            params.append(monitor_mode)
+            assignments.append(
+                "last_message_id = CASE "
+                "WHEN telegram_monitor_mode != ? THEN NULL "
+                "ELSE last_message_id END"
+            )
+            params.append(monitor_mode)
+        if tracked_posts_limit is not None:
+            assignments.append("tracked_posts_limit = ?")
+            params.append(tracked_posts_limit)
+        params.append(source_id)
+        connection = self.database.require_connection()
+        await connection.execute(
+            f"UPDATE sources SET {', '.join(assignments)} WHERE id = ?",
+            tuple(params),
         )
         await connection.commit()
 
@@ -195,6 +302,20 @@ class PostRepository:
             ORDER BY date ASC
             """,
             (source_id, start, end),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [Post.from_row(row) for row in rows]
+
+    async def list_recent(self, source_id: int, limit: int = 10) -> list[Post]:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT * FROM posts
+            WHERE source_id = ?
+            ORDER BY date DESC
+            LIMIT ?
+            """,
+            (source_id, limit),
         ) as cursor:
             rows = await cursor.fetchall()
         return [Post.from_row(row) for row in rows]
@@ -275,6 +396,193 @@ class CommentRepository:
         ) as cursor:
             row = await cursor.fetchone()
         return int(row["count"])
+
+    async def list_by_period(self, source_id: int, start: str, end: str) -> list[Comment]:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT * FROM comments
+            WHERE source_id = ? AND date >= ? AND date <= ?
+            ORDER BY date ASC
+            """,
+            (source_id, start, end),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [Comment.from_row(row) for row in rows]
+
+
+class TelegramGroupMessageRepository:
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    async def upsert_message(
+        self,
+        *,
+        source_id: int,
+        telegram_message_id: int,
+        from_id: int | None,
+        date: str,
+        text: str | None,
+        message_url: str | None,
+    ) -> tuple[TelegramGroupMessage, bool]:
+        connection = self.database.require_connection()
+        now = utc_now_iso()
+        existing = await self.get_by_message_id(source_id, telegram_message_id)
+        await connection.execute(
+            """
+            INSERT INTO telegram_group_messages (
+                source_id, telegram_message_id, from_id, date, text, message_url,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_id, telegram_message_id) DO UPDATE SET
+                from_id = excluded.from_id,
+                date = excluded.date,
+                text = excluded.text,
+                message_url = excluded.message_url,
+                updated_at = excluded.updated_at
+            """,
+            (
+                source_id,
+                telegram_message_id,
+                from_id,
+                date,
+                text,
+                message_url,
+                now,
+                now,
+            ),
+        )
+        await connection.commit()
+        message = await self.get_by_message_id(source_id, telegram_message_id)
+        if message is None:
+            raise RuntimeError("Upserted Telegram group message disappeared.")
+        return message, existing is None
+
+    async def get_by_message_id(
+        self,
+        source_id: int,
+        telegram_message_id: int,
+    ) -> TelegramGroupMessage | None:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT * FROM telegram_group_messages
+            WHERE source_id = ? AND telegram_message_id = ?
+            """,
+            (source_id, telegram_message_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return TelegramGroupMessage.from_row(row) if row else None
+
+    async def count_by_period(self, source_id: int, start: str, end: str) -> int:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT COUNT(*) AS count FROM telegram_group_messages
+            WHERE source_id = ? AND date >= ? AND date <= ?
+            """,
+            (source_id, start, end),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row["count"])
+
+    async def list_by_period(
+        self,
+        source_id: int,
+        start: str,
+        end: str,
+    ) -> list[TelegramGroupMessage]:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT * FROM telegram_group_messages
+            WHERE source_id = ? AND date >= ? AND date <= ?
+            ORDER BY date ASC
+            """,
+            (source_id, start, end),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [TelegramGroupMessage.from_row(row) for row in rows]
+
+    async def list_recent(
+        self,
+        source_id: int,
+        limit: int = 10,
+    ) -> list[TelegramGroupMessage]:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT * FROM telegram_group_messages
+            WHERE source_id = ?
+            ORDER BY date DESC
+            LIMIT ?
+            """,
+            (source_id, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [TelegramGroupMessage.from_row(row) for row in rows]
+
+
+class TelegramKeywordRepository:
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    async def list_keywords(self, include_inactive: bool = False) -> list[TelegramKeyword]:
+        connection = self.database.require_connection()
+        query = "SELECT * FROM telegram_keywords"
+        if not include_inactive:
+            query += " WHERE is_active = 1"
+        query += " ORDER BY keyword COLLATE NOCASE"
+        async with connection.execute(query) as cursor:
+            rows = await cursor.fetchall()
+        return [TelegramKeyword.from_row(row) for row in rows]
+
+    async def add_keyword(self, keyword: str) -> TelegramKeyword:
+        normalized = keyword.strip()
+        if not normalized:
+            raise ValueError("Keyword is empty.")
+        connection = self.database.require_connection()
+        now = utc_now_iso()
+        await connection.execute(
+            """
+            INSERT INTO telegram_keywords(keyword, is_active, created_at, updated_at)
+            VALUES (?, 1, ?, ?)
+            ON CONFLICT(keyword) DO UPDATE SET
+                is_active = 1,
+                updated_at = excluded.updated_at
+            """,
+            (normalized, now, now),
+        )
+        await connection.commit()
+        async with connection.execute(
+            "SELECT * FROM telegram_keywords WHERE keyword = ?",
+            (normalized,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("Upserted keyword disappeared.")
+        return TelegramKeyword.from_row(row)
+
+    async def deactivate_keyword(self, keyword_id: int) -> bool:
+        connection = self.database.require_connection()
+        cursor = await connection.execute(
+            """
+            UPDATE telegram_keywords
+            SET is_active = 0, updated_at = ?
+            WHERE id = ? AND is_active = 1
+            """,
+            (utc_now_iso(), keyword_id),
+        )
+        await connection.commit()
+        return cursor.rowcount > 0
+
+    async def matching_keywords(self, text: str | None) -> list[TelegramKeyword]:
+        if not text:
+            return []
+        haystack = text.casefold()
+        keywords = await self.list_keywords()
+        return [keyword for keyword in keywords if keyword.keyword.casefold() in haystack]
 
 
 class StatsSnapshotRepository:
@@ -581,6 +889,29 @@ class VkRepository:
             row = await cursor.fetchone()
         return VkPost.from_row(row) if row else None
 
+    async def adjust_post_counters(
+        self,
+        group_id: int,
+        post_id: int,
+        *,
+        likes_delta: int = 0,
+        comments_delta: int = 0,
+    ) -> VkPost | None:
+        connection = self.database.require_connection()
+        await connection.execute(
+            """
+            UPDATE vk_posts
+            SET
+                likes_count = MAX(0, likes_count + ?),
+                comments_count = MAX(0, comments_count + ?),
+                updated_at = ?
+            WHERE group_id = ? AND post_id = ?
+            """,
+            (likes_delta, comments_delta, utc_now_iso(), group_id, post_id),
+        )
+        await connection.commit()
+        return await self.get_post(group_id, post_id)
+
     async def upsert_comment(
         self,
         *,
@@ -775,6 +1106,8 @@ class RepositoryBundle:
         self.sources = SourceRepository(database)
         self.posts = PostRepository(database)
         self.comments = CommentRepository(database)
+        self.group_messages = TelegramGroupMessageRepository(database)
+        self.keywords = TelegramKeywordRepository(database)
         self.snapshots = StatsSnapshotRepository(database)
         self.alerts = AlertRepository(database)
         self.scheduler_state = SchedulerStateRepository(database)
@@ -786,4 +1119,6 @@ class RepositoryBundle:
             sources=self.sources,
             posts=self.posts,
             comments=self.comments,
+            group_messages=self.group_messages,
+            vk=self.vk,
         )

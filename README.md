@@ -81,7 +81,8 @@ VK commands:
 - `/vk_status`
 - `/vk_setup`
 - `/vk_sync`
-- `/vk_recent_posts`
+- `/vk_recent_posts [limit]`
+- `/vk_posts 24h 10`
 - `/vk_recent_comments`
 - `/vk_dashboard 7d`
 - `/vk_watch_on`
@@ -129,12 +130,26 @@ Telegram commands:
 
 - `/tg_status`
 - `/tg_auth`
+- `/tg_add_source`
 - `/tg_sources`
+- `/tg_keywords`
+- `/tg_add_keyword <text>`
+- `/tg_remove_keyword <id>`
+- `/tg_recent_posts <source_id_or_telegram_id> [limit]`
+- `/tg_posts <source_id_or_telegram_id> <period> [limit]`
 - `/tg_sync_posts <source_id>`
-- `/tg_dashboard <source_id> <period>`
+- `/tg_dashboard <source_id_or_telegram_id> <period>`
 
 Legacy commands such as `/sources`, `/add_source`, `/sync_posts`, and `/dashboard`
 still work when Telegram Monitor is available.
+
+`/tg_add_source` expects a forwarded message from a channel, group, or discussion
+group. After that Argus asks whether to monitor the source as posts or as a
+discussion/comment stream. First sync stores a baseline and does not alert old
+messages.
+
+Use `/tg_sources` to see internal source IDs. Commands that read local Telegram
+data also accept saved Telegram ids such as `-1001451549966`.
 
 ## Bot UI
 
@@ -151,17 +166,33 @@ still work when Telegram Monitor is available.
 Inline callbacks edit the existing message when possible. The UI is restricted to
 `ADMIN_IDS`.
 
+Users without access can send `/request_access`. Argus sends the current admins an
+inline approval card; approving it appends the user id to `ADMIN_IDS` in `.env` and
+updates the running process immediately.
+
 The Alerts menu writes runtime settings:
 
 - `alerts_vk_enabled`
 - `alerts_vk_posts_enabled`
 - `alerts_vk_comments_enabled`
+- `alerts_telegram_enabled`
+- `alerts_telegram_posts_enabled`
+- `alerts_telegram_comments_enabled`
+- `alerts_telegram_keywords_enabled`
 
-VK dashboard messages are capped: Argus counts comments in SQLite but only shows a
-small recent sample, so a 30-day dashboard does not try to send every comment.
+Dashboard messages are capped: Argus counts comments/messages in SQLite but only
+shows compact summaries. When `matplotlib` is installed, `/tg_dashboard` and
+`/vk_dashboard` send a PNG chart with the dashboard text attached as the photo
+caption. Charts are generated locally from SQLite data and still render when the
+selected period has no rows.
+
+VK live likes are counted from VK Long Poll `like_add` / `like_remove` events for
+posts that already exist in SQLite. If these counters stay unchanged, check that
+the community Long Poll settings include like events.
 
 General commands:
 
+- `/request_access`
 - `/help`
 - `/status`
 - `/modules`
@@ -176,6 +207,7 @@ docker compose up
 
 The compose service uses `build: .` and mounts:
 
+- `./.env:/app/.env`
 - `./data:/app/data`
 - `./logs:/app/logs`
 - `./sessions:/app/sessions`
@@ -186,7 +218,8 @@ SQLite is stored at `DATABASE_PATH`, default `data/argus.sqlite3`.
 
 Main tables:
 
-- Telegram: `sources`, `posts`, `comments`, `stats_snapshots`
+- Telegram: `sources`, `posts`, `comments`, `telegram_group_messages`,
+  `telegram_keywords`, `stats_snapshots`
 - VK: `vk_sources`, `vk_posts`, `vk_comments`, `vk_stats_snapshots`
 - Runtime: `runtime_settings`, `scheduler_state`, `alerts`
 

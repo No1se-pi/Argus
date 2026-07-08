@@ -8,6 +8,7 @@ from typing import Any
 import aiohttp
 from pydantic import SecretStr
 
+from app.analytics.dashboard import _bucket_labels, _counts_by_bucket, _render_chart, _sum_by_bucket
 from app.analytics.periods import parse_period
 from app.config import Settings
 from app.modules import ModuleInfo, ModuleStatus
@@ -174,10 +175,16 @@ class VKService:
                 code="polling_user_token_missing",
                 method="wall.get",
             )
-        client = VKClient(access_token=config.polling_token, api_version=self.settings.vk_api_version)
+        client = VKClient(
+            access_token=config.polling_token,
+            api_version=self.settings.vk_api_version,
+        )
         source = await self.healthcheck()
         try:
-            posts = await client.get_wall_posts(config.group_id, count=self.settings.vk_recent_posts_limit)
+            posts = await client.get_wall_posts(
+                config.group_id,
+                count=self.settings.vk_recent_posts_limit,
+            )
         except VKAPIError as exc:
             if exc.code == 27:
                 raise VKAPIError(
@@ -214,7 +221,11 @@ class VKService:
                 raise
             comments_processed += len(comments)
             for raw_comment in comments:
-                comment, created = await self._save_comment(config.group_id, post.post_id, raw_comment)
+                comment, created = await self._save_comment(
+                    config.group_id,
+                    post.post_id,
+                    raw_comment,
+                )
                 if created:
                     new_comments.append(comment)
 
@@ -237,7 +248,8 @@ class VKService:
         if config.group_token and config.monitor_mode == "longpoll":
             return await self.longpoll_once(wait_seconds=2)
         raise VKAPIError(
-            "VK sync needs VK_USER_ACCESS_TOKEN for polling history or VK_GROUP_TOKEN for Long Poll.",
+            "VK sync needs VK_USER_ACCESS_TOKEN for polling history "
+            "or VK_GROUP_TOKEN for Long Poll.",
             code="sync_token_missing",
         )
 
@@ -288,6 +300,7 @@ class VKService:
                 event_object = event_object["post"]
             if event_type == "wall_post_new":
                 post, created = await self._save_post(source, event_object)
+                await self.repository.create_snapshot(post)
                 if created:
                     new_posts.append(post)
             elif event_type == "wall_reply_new":
@@ -301,6 +314,24 @@ class VKService:
                 )
                 if created:
                     new_comments.append(comment)
+                    updated_post = await self.repository.adjust_post_counters(
+                        config.group_id,
+                        int(post_id),
+                        comments_delta=1,
+                    )
+                    if updated_post is not None:
+                        await self.repository.create_snapshot(updated_post)
+            elif event_type in {"like_add", "like_remove"}:
+                post_id = self._like_post_id(event_object, config.group_id)
+                if post_id is None:
+                    continue
+                updated_post = await self.repository.adjust_post_counters(
+                    config.group_id,
+                    post_id,
+                    likes_delta=1 if event_type == "like_add" else -1,
+                )
+                if updated_post is not None:
+                    await self.repository.create_snapshot(updated_post)
 
         self._last_error = None
         self._last_success_at = datetime.now(UTC).isoformat()
@@ -341,6 +372,7 @@ class VKService:
                 "/vk_status",
                 "/vk_setup",
                 "/vk_recent_posts",
+                "/vk_posts",
                 "/vk_recent_comments",
                 "/vk_sync",
                 "/vk_dashboard",
@@ -351,7 +383,9 @@ class VKService:
         user_token_status = "set" if config.user_access_token else "missing"
         group_status = str(config.group_id) if config.group_id is not None else "missing"
         posts_count = await self.repository.count_posts(config.group_id) if config.group_id else 0
-        comments_count = await self.repository.count_comments(config.group_id) if config.group_id else 0
+        comments_count = (
+            await self.repository.count_comments(config.group_id) if config.group_id else 0
+        )
         return "\n".join(
             [
                 "<b>VK status</b>",
@@ -371,13 +405,37 @@ class VKService:
 
     async def render_recent_posts(self, limit: int = 10) -> str:
         config = await self._require_config()
+        limit = self._clamp_post_limit(limit)
         posts = await self.repository.list_recent_posts(config.group_id, limit)
         if not posts:
             return "VK posts: no data yet. Run /vk_sync first."
-        lines = ["<b>VK recent posts</b>"]
+        lines = [f"<b>VK recent posts</b> (last {limit})"]
         for post in posts:
-            lines.append(f"- {self._post_snippet(post)}")
-        return "\n".join(lines)
+            lines.append(self._format_post_line(post))
+        return self._trim_message("\n".join(lines))
+
+    async def render_posts_by_period(self, period_value: str, limit: int = 10) -> str:
+        config = await self._require_config()
+        period = parse_period(period_value)
+        limit = self._clamp_post_limit(limit)
+        posts = await self.repository.list_posts_by_period(
+            config.group_id,
+            period.start_iso,
+            period.end_iso,
+        )
+        total = len(posts)
+        posts = sorted(posts, key=lambda item: item.date, reverse=True)[:limit]
+        if not posts:
+            return f"VK posts: no data for {escape(period.label)}. Run /vk_sync first."
+        lines = [
+            "<b>VK posts</b>",
+            f"Период: {escape(period.label)}",
+            f"Показано: {len(posts)} из {total}",
+            "",
+        ]
+        for post in posts:
+            lines.append(self._format_post_line(post))
+        return self._trim_message("\n".join(lines))
 
     async def render_recent_comments(self, limit: int = 10) -> str:
         config = await self._require_config()
@@ -441,6 +499,33 @@ class VKService:
             ]
         )
 
+    async def render_dashboard_chart_png(self, period_value: str) -> bytes | None:
+        config = await self._require_config()
+        period = parse_period(period_value)
+        source = await self.repository.get_source(config.group_id)
+        posts = await self.repository.list_posts_by_period(
+            config.group_id,
+            period.start_iso,
+            period.end_iso,
+        )
+        comments = await self.repository.list_comments_by_period(
+            config.group_id,
+            period.start_iso,
+            period.end_iso,
+        )
+        buckets = _bucket_labels(period.start_iso, period.end_iso, period_value)
+        series = {
+            "Посты": _counts_by_bucket([post.date for post in posts], buckets),
+            "Комментарии": _counts_by_bucket([comment.date for comment in comments], buckets),
+            "Лайки": _sum_by_bucket([(post.date, post.likes_count) for post in posts], buckets),
+        }
+        title = f"VK {source.display_name if source else config.group_id} · {period.label}"
+        return _render_chart(
+            title=title,
+            labels=[label for label, _start, _end in buckets],
+            series=series,
+        )
+
     async def save_setup(
         self,
         *,
@@ -451,7 +536,11 @@ class VKService:
         if group_token:
             await self.runtime_settings.set("vk_group_token", group_token, is_secret=True)
         if user_access_token:
-            await self.runtime_settings.set("vk_user_access_token", user_access_token, is_secret=True)
+            await self.runtime_settings.set(
+                "vk_user_access_token",
+                user_access_token,
+                is_secret=True,
+            )
         if group_id is not None:
             await self.runtime_settings.set("vk_group_id", str(abs(group_id)), is_secret=False)
         await self.runtime_settings.set("enable_vk_monitor", "true", is_secret=False)
@@ -562,6 +651,31 @@ class VKService:
             return int(value.get("count") or 0)
         return 0
 
+    def _like_post_id(self, payload: dict[str, Any], group_id: int) -> int | None:
+        object_type = str(payload.get("object_type") or payload.get("type") or "").lower()
+        if object_type and object_type not in {"post", "wall"}:
+            return None
+
+        owner_id = payload.get("object_owner_id") or payload.get("owner_id")
+        if owner_id is not None:
+            try:
+                if int(owner_id) not in {-abs(group_id), abs(group_id)}:
+                    return None
+            except (TypeError, ValueError):
+                return None
+
+        for key in ("post_id", "object_id", "item_id"):
+            raw_value = payload.get(key)
+            if raw_value is None:
+                continue
+            try:
+                post_id = int(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if post_id > 0:
+                return post_id
+        return None
+
     def _format_top_posts(self, posts: list[VkPost], metric: str) -> list[str]:
         if not posts:
             return ["Нет данных."]
@@ -574,7 +688,17 @@ class VKService:
     def _format_comments(self, comments: list[VkComment]) -> list[str]:
         if not comments:
             return ["Нет данных."]
-        return [f"- post {comment.post_id}: {escape(self._short(comment.text or '', 80))}" for comment in comments]
+        return [
+            f"- post {comment.post_id}: {escape(self._short(comment.text or '', 80))}"
+            for comment in comments
+        ]
+
+    def _format_post_line(self, post: VkPost) -> str:
+        return (
+            f"- {escape(post.date[:16])} · {self._post_snippet(post)} · "
+            f"views: {post.views_count}, likes: {post.likes_count}, "
+            f"comments: {post.comments_count}, reposts: {post.reposts_count}"
+        )
 
     def _post_snippet(self, post: VkPost) -> str:
         text = self._short(post.text or f"post {post.post_id}", 80)
@@ -587,6 +711,15 @@ class VKService:
         if len(normalized) <= length:
             return normalized
         return f"{normalized[: length - 3]}..."
+
+    def _clamp_post_limit(self, limit: int) -> int:
+        return min(max(limit, 1), 30)
+
+    def _trim_message(self, text: str, limit: int = 3900) -> str:
+        if len(text) <= limit:
+            return text
+        trimmed = text[: limit - 20].rsplit("\n", maxsplit=1)[0].strip()
+        return f"{trimmed}\n...обрезано."
 
     def _secret_value(self, value: SecretStr | None) -> str | None:
         if value is None:
