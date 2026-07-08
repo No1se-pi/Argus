@@ -12,6 +12,9 @@ UTC = timezone.utc
 
 
 class VKPollingScheduler:
+    LONGPOLL_WAIT_SECONDS = 25
+    LONGPOLL_HARD_TIMEOUT_SECONDS = 45
+
     def __init__(
         self,
         *,
@@ -77,9 +80,24 @@ class VKPollingScheduler:
 
     async def _run_longpoll_or_fallback(self, config: VKEffectiveConfig) -> VKSyncResult:
         try:
-            result = await self.service.longpoll_once()
+            logger.info(
+                "VK Long Poll request started: group_id=%s wait=%ss",
+                config.group_id,
+                self.LONGPOLL_WAIT_SECONDS,
+            )
+            result = await asyncio.wait_for(
+                self.service.longpoll_once(wait_seconds=self.LONGPOLL_WAIT_SECONDS),
+                timeout=self.LONGPOLL_HARD_TIMEOUT_SECONDS,
+            )
             self._log_result("VK Long Poll sync", result)
             return result
+        except TimeoutError:
+            self.service.reset_longpoll_state()
+            logger.warning(
+                "VK Long Poll timed out after %ss; state reset and next cycle will reconnect",
+                self.LONGPOLL_HARD_TIMEOUT_SECONDS,
+            )
+            return self._empty_result(config)
         except Exception:
             if not self.settings.vk_enable_polling_fallback or not config.polling_token:
                 raise
@@ -132,6 +150,15 @@ class VKPollingScheduler:
             result.comments_processed,
             len(result.new_posts),
             len(result.new_comments),
+        )
+
+    def _empty_result(self, config: VKEffectiveConfig) -> VKSyncResult:
+        return VKSyncResult(
+            group_id=config.group_id or 0,
+            posts_processed=0,
+            comments_processed=0,
+            new_posts=[],
+            new_comments=[],
         )
 
     async def _next_delay_seconds(self) -> int:

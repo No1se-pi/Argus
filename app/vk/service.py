@@ -274,8 +274,13 @@ class VKService:
             "ts": ts,
             "wait": wait_seconds,
         }
+        timeout = aiohttp.ClientTimeout(
+            total=wait_seconds + 10,
+            sock_connect=10,
+            sock_read=wait_seconds + 5,
+        )
         async with aiohttp.ClientSession() as session:
-            async with session.get(server, params=params, timeout=wait_seconds + 10) as response:
+            async with session.get(server, params=params, timeout=timeout) as response:
                 data = await response.json(content_type=None)
 
         if "failed" in data:
@@ -343,6 +348,12 @@ class VKService:
             new_posts=new_posts,
             new_comments=new_comments,
         )
+
+    def reset_longpoll_state(self) -> None:
+        self._longpoll_group_id = None
+        self._longpoll_server = None
+        self._longpoll_key = None
+        self._longpoll_ts = None
 
     async def _get_longpoll_state(
         self,
