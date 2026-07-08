@@ -381,10 +381,11 @@ class VKService:
 
     async def render_recent_comments(self, limit: int = 10) -> str:
         config = await self._require_config()
+        limit = min(max(limit, 1), 20)
         comments = await self.repository.list_recent_comments(config.group_id, limit)
         if not comments:
             return "VK comments: no data yet. Run /vk_sync first."
-        lines = ["<b>VK recent comments</b>"]
+        lines = [f"<b>VK recent comments</b> (last {limit})"]
         for comment in comments:
             text = self._short(comment.text or "(no text)", 80)
             lines.append(f"- post {comment.post_id}: {escape(text)}")
@@ -399,19 +400,23 @@ class VKService:
             period.start_iso,
             period.end_iso,
         )
-        comments = await self.repository.list_comments_by_period(
+        comments_count = await self.repository.count_comments_by_period(
             config.group_id,
             period.start_iso,
             period.end_iso,
         )
+        recent_comments = await self.repository.list_recent_comments_by_period(
+            config.group_id,
+            period.start_iso,
+            period.end_iso,
+            limit=5,
+        )
         likes_total = sum(post.likes_count for post in posts)
         posts_count = len(posts)
-        comments_count = len(comments)
         avg_likes = likes_total / posts_count if posts_count else 0
         avg_comments = comments_count / posts_count if posts_count else 0
         top_likes = sorted(posts, key=lambda item: item.likes_count, reverse=True)[:3]
         top_comments = sorted(posts, key=lambda item: item.comments_count, reverse=True)[:3]
-        recent_comments = comments[-5:]
 
         return "\n".join(
             [
@@ -436,9 +441,17 @@ class VKService:
             ]
         )
 
-    async def save_setup(self, *, access_token: str | None, group_id: int | None) -> None:
-        if access_token:
-            await self.runtime_settings.set("vk_group_token", access_token, is_secret=True)
+    async def save_setup(
+        self,
+        *,
+        group_token: str | None,
+        user_access_token: str | None,
+        group_id: int | None,
+    ) -> None:
+        if group_token:
+            await self.runtime_settings.set("vk_group_token", group_token, is_secret=True)
+        if user_access_token:
+            await self.runtime_settings.set("vk_user_access_token", user_access_token, is_secret=True)
         if group_id is not None:
             await self.runtime_settings.set("vk_group_id", str(abs(group_id)), is_secret=False)
         await self.runtime_settings.set("enable_vk_monitor", "true", is_secret=False)

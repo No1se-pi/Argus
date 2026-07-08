@@ -18,6 +18,7 @@ from app.scheduler.rate_limit import TelegramRateLimiter
 from app.storage.database import Database
 from app.storage.repositories import RepositoryBundle
 from app.storage.schema import init_schema
+from app.telegram_auth import TelegramAuthService
 from app.vk.scheduler import VKPollingScheduler
 from app.vk.service import VKService
 
@@ -37,7 +38,12 @@ async def main() -> None:
         token=settings.bot_token.get_secret_value(),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    alert_service = AlertService(bot=bot, settings=settings, alerts=repositories.alerts)
+    alert_service = AlertService(
+        bot=bot,
+        settings=settings,
+        alerts=repositories.alerts,
+        runtime_settings=repositories.runtime_settings,
+    )
 
     telegram_client, collector = await _start_telegram_monitor(settings, repositories)
     vk_service = VKService(
@@ -51,6 +57,7 @@ async def main() -> None:
         vk_service=vk_service,
         telegram_collector=collector,
     )
+    telegram_auth_service = TelegramAuthService(settings)
 
     dispatcher = create_dispatcher(
         settings=settings,
@@ -61,6 +68,7 @@ async def main() -> None:
         module_registry=module_registry,
         vk_service=vk_service,
         runtime_settings_repo=repositories.runtime_settings,
+        telegram_auth_service=telegram_auth_service,
     )
 
     schedulers = []

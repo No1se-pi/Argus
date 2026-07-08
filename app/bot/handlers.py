@@ -7,13 +7,18 @@ from aiogram.types import Message
 
 from app.analytics.dashboard import DashboardService
 from app.analytics.periods import parse_period
-from app.bot.keyboards import main_menu_keyboard, setup_cancel_keyboard, vk_menu_keyboard
-from app.bot.screens import main_menu_text, modules_text, setup_text, status_text
-from app.bot.states import VKSetupStates
+from app.bot.keyboards import main_menu_keyboard, vk_setup_keyboard
+from app.bot.screens import (
+    main_menu_text,
+    modules_text,
+    setup_text,
+    status_text,
+    telegram_auth_cli_text,
+)
 from app.collectors.telegram import LargeFloodWait, TelegramCollector, TelegramSourceError
-from app.config import Settings
 from app.modules import ModuleRegistry, ModuleStatus
 from app.storage.repositories import SourceRepository
+from app.telegram_auth import TelegramAuthService
 from app.vk.service import VKService
 
 router = Router(name="admin")
@@ -41,6 +46,7 @@ VK:
 
 Telegram Monitor:
 /tg_status
+/tg_auth
 /tg_sources
 /tg_dashboard &lt;source_id&gt; &lt;period&gt;
 /tg_sync_posts &lt;source_id&gt;
@@ -90,23 +96,8 @@ async def vk_status_command(message: Message, vk_service: VKService) -> None:
 
 @router.message(Command("vk_setup"))
 async def vk_setup_command(message: Message, state: FSMContext, vk_service: VKService) -> None:
-    config = await vk_service.effective_config()
     await state.clear()
-    await state.update_data(access_token=None)
-    if not config.group_token:
-        await state.set_state(VKSetupStates.waiting_token)
-        await message.answer(
-            await vk_service.config_summary()
-            + "\n\nОтправь VK_GROUP_TOKEN следующим сообщением.",
-            reply_markup=setup_cancel_keyboard(can_skip=False),
-        )
-        return
-
-    await state.set_state(VKSetupStates.waiting_group_id)
-    await message.answer(
-        await vk_service.config_summary() + "\n\nОтправь VK_GROUP_ID следующим сообщением.",
-        reply_markup=setup_cancel_keyboard(can_skip=config.group_id is not None),
-    )
+    await message.answer(await vk_service.config_summary(), reply_markup=vk_setup_keyboard())
 
 
 @router.message(Command("vk_sync"))
@@ -141,16 +132,26 @@ async def vk_recent_posts_command(message: Message, vk_service: VKService) -> No
 @router.message(Command("vk_recent_comments"))
 async def vk_recent_comments_command(message: Message, vk_service: VKService) -> None:
     try:
-        await message.answer(await vk_service.render_recent_comments(), disable_web_page_preview=True)
+        await message.answer(
+            await vk_service.render_recent_comments(),
+            disable_web_page_preview=True,
+        )
     except Exception as exc:
         await message.answer(f"VK comments unavailable: {_format_error(exc)}")
 
 
 @router.message(Command("vk_dashboard"))
-async def vk_dashboard_command(message: Message, command: CommandObject, vk_service: VKService) -> None:
+async def vk_dashboard_command(
+    message: Message,
+    command: CommandObject,
+    vk_service: VKService,
+) -> None:
     period = _single_argument(command) or "7d"
     try:
-        await message.answer(await vk_service.render_dashboard(period), disable_web_page_preview=True)
+        await message.answer(
+            await vk_service.render_dashboard(period),
+            disable_web_page_preview=True,
+        )
     except Exception as exc:
         await message.answer(f"VK dashboard unavailable: {_format_error(exc)}")
 
@@ -172,6 +173,18 @@ async def tg_status_command(message: Message, module_registry: ModuleRegistry) -
     info = await module_registry.telegram_info()
     reason = f"\nReason: {escape(info.reason)}" if info.reason else ""
     await message.answer(f"<b>Telegram Monitor</b>\nStatus: {info.status.value}{reason}")
+
+
+@router.message(Command("tg_auth"))
+async def tg_auth_command(
+    message: Message,
+    state: FSMContext,
+    telegram_auth_service: TelegramAuthService,
+) -> None:
+    await state.clear()
+    await message.answer(
+        telegram_auth_cli_text(telegram_auth_service.is_configured()),
+    )
 
 
 @router.message(Command("tg_sources", "sources"))
@@ -258,7 +271,9 @@ async def remove_source_command(
         return
 
     removed = await source_repo.deactivate(source_id)
-    await message.answer("Источник отключён." if removed else "Источник не найден или уже отключён.")
+    await message.answer(
+        "Источник отключён." if removed else "Источник не найден или уже отключён."
+    )
 
 
 @router.message(Command("tg_sync_posts", "sync_posts"))
@@ -275,7 +290,12 @@ async def sync_posts_command(
         await message.answer("Telegram Monitor недоступен: Telethon client is not running.")
         return
 
-    source = await _get_active_source(message, command, source_repo, usage="/tg_sync_posts <source_id>")
+    source = await _get_active_source(
+        message,
+        command,
+        source_repo,
+        usage="/tg_sync_posts <source_id>",
+    )
     if source is None:
         return
 
@@ -310,7 +330,10 @@ async def dashboard_command(
 
     args = (command.args or "").split()
     if len(args) != 2:
-        await message.answer("Использование: /tg_dashboard <source_id> <period>, например /tg_dashboard 1 7d")
+        await message.answer(
+            "Использование: /tg_dashboard <source_id> <period>, "
+            "например /tg_dashboard 1 7d"
+        )
         return
 
     try:
@@ -337,7 +360,12 @@ async def join_source_command(
         await message.answer("Telegram Monitor недоступен: Telethon client is not running.")
         return
 
-    source = await _get_active_source(message, command, source_repo, usage="/join_source <source_id>")
+    source = await _get_active_source(
+        message,
+        command,
+        source_repo,
+        usage="/join_source <source_id>",
+    )
     if source is None:
         return
     try:
@@ -362,7 +390,12 @@ async def leave_source_command(
         await message.answer("Telegram Monitor недоступен: Telethon client is not running.")
         return
 
-    source = await _get_active_source(message, command, source_repo, usage="/leave_source <source_id>")
+    source = await _get_active_source(
+        message,
+        command,
+        source_repo,
+        usage="/leave_source <source_id>",
+    )
     if source is None:
         return
     try:
@@ -387,7 +420,12 @@ async def sync_comments_command(
         await message.answer("Telegram Monitor недоступен: Telethon client is not running.")
         return
 
-    source = await _get_active_source(message, command, source_repo, usage="/sync_comments <source_id>")
+    source = await _get_active_source(
+        message,
+        command,
+        source_repo,
+        usage="/sync_comments <source_id>",
+    )
     if source is None:
         return
 
@@ -417,7 +455,12 @@ async def sync_reactions_command(
         await message.answer("Telegram Monitor недоступен: Telethon client is not running.")
         return
 
-    source = await _get_active_source(message, command, source_repo, usage="/sync_reactions <source_id>")
+    source = await _get_active_source(
+        message,
+        command,
+        source_repo,
+        usage="/sync_reactions <source_id>",
+    )
     if source is None:
         return
 

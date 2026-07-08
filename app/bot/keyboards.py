@@ -143,6 +143,31 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def vk_setup_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Ввести VK_GROUP_TOKEN", callback_data="setup:vk_gt")],
+            [InlineKeyboardButton(text="Ввести VK_USER_ACCESS_TOKEN", callback_data="setup:vk_ut")],
+            [InlineKeyboardButton(text="Ввести VK_GROUP_ID", callback_data="setup:vk_gid")],
+            [InlineKeyboardButton(text="Проверить VK", callback_data="vk:status")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
+        ]
+    )
+
+
+def telegram_setup_keyboard(can_auth: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if can_auth:
+        rows.append([InlineKeyboardButton(text="Авторизовать Telethon", callback_data="tg:auth")])
+    rows.extend(
+        [
+            [InlineKeyboardButton(text="🩺 TG статус", callback_data="tg:status")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def alerts_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

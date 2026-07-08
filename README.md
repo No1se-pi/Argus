@@ -114,9 +114,21 @@ TG_SESSION_DIR=sessions
 
 Create the Telethon session locally. Session files are ignored by Git.
 
+```bash
+python -m app.telegram_login
+```
+
+Do not send Telegram login codes to the Argus bot or any Telegram chat. Telegram
+can block the login attempt if it sees that the code was shared from your account.
+`/tg_auth` in the bot only shows the safe local CLI instruction.
+
+Restart Argus after successful auth so the Telegram Monitor scheduler can attach
+to the new session.
+
 Telegram commands:
 
 - `/tg_status`
+- `/tg_auth`
 - `/tg_sources`
 - `/tg_sync_posts <source_id>`
 - `/tg_dashboard <source_id> <period>`
@@ -138,6 +150,15 @@ still work when Telegram Monitor is available.
 
 Inline callbacks edit the existing message when possible. The UI is restricted to
 `ADMIN_IDS`.
+
+The Alerts menu writes runtime settings:
+
+- `alerts_vk_enabled`
+- `alerts_vk_posts_enabled`
+- `alerts_vk_comments_enabled`
+
+VK dashboard messages are capped: Argus counts comments in SQLite but only shows a
+small recent sample, so a 30-day dashboard does not try to send every comment.
 
 General commands:
 

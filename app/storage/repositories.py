@@ -423,6 +423,12 @@ class RuntimeSettingsRepository:
             row = await cursor.fetchone()
         return str(row["value"]) if row else None
 
+    async def get_bool(self, key: str, default: bool) -> bool:
+        value = await self.get(key)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
     async def set(self, key: str, value: str, *, is_secret: bool = False) -> None:
         connection = self.database.require_connection()
         await connection.execute(
@@ -694,6 +700,38 @@ class VkRepository:
             ORDER BY date ASC
             """,
             (group_id, start, end),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [VkComment.from_row(row) for row in rows]
+
+    async def count_comments_by_period(self, group_id: int, start: str, end: str) -> int:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT COUNT(*) AS count FROM vk_comments
+            WHERE group_id = ? AND date >= ? AND date <= ? AND is_deleted = 0
+            """,
+            (group_id, start, end),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row["count"])
+
+    async def list_recent_comments_by_period(
+        self,
+        group_id: int,
+        start: str,
+        end: str,
+        limit: int = 5,
+    ) -> list[VkComment]:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT * FROM vk_comments
+            WHERE group_id = ? AND date >= ? AND date <= ? AND is_deleted = 0
+            ORDER BY date DESC
+            LIMIT ?
+            """,
+            (group_id, start, end, limit),
         ) as cursor:
             rows = await cursor.fetchall()
         return [VkComment.from_row(row) for row in rows]

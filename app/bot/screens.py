@@ -99,6 +99,31 @@ def unavailable_text(module: ModuleInfo) -> str:
     )
 
 
+def telegram_auth_cli_text(configured: bool) -> str:
+    if not configured:
+        return "\n".join(
+            [
+                "<b>Telethon auth недоступен</b>",
+                "",
+                "Сначала укажи <code>TG_API_ID</code> и <code>TG_API_HASH</code> в .env.",
+            ]
+        )
+
+    return "\n".join(
+        [
+            "<b>Telethon auth</b>",
+            "",
+            "Telegram блокирует вход, если login-code отправить в Telegram-чат или боту.",
+            "Поэтому код нужно вводить только локально в терминале на этом ПК.",
+            "",
+            "Останови Argus и запусти:",
+            "<code>python -m app.telegram_login</code>",
+            "",
+            "После успешной авторизации снова запусти Argus.",
+        ]
+    )
+
+
 def _module_line(module: ModuleInfo) -> str:
     icon = STATUS_ICON[module.status]
     return f"{icon} {escape(module.name)} — {escape(module.status.value)}"

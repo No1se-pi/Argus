@@ -16,13 +16,23 @@ from app.bot.keyboards import (
     setup_cancel_keyboard,
     status_keyboard,
     telegram_menu_keyboard,
+    telegram_setup_keyboard,
     vk_menu_keyboard,
+    vk_setup_keyboard,
 )
-from app.bot.screens import main_menu_text, modules_text, setup_text, status_text, unavailable_text
-from app.bot.states import VKSetupStates
+from app.bot.screens import (
+    main_menu_text,
+    modules_text,
+    setup_text,
+    status_text,
+    telegram_auth_cli_text,
+    unavailable_text,
+)
+from app.bot.states import TelegramAuthStates, VKSetupStates
+from app.config import Settings
 from app.modules import ModuleRegistry, ModuleStatus
-from app.storage.repositories import SourceRepository
-from app.vk.client import VKAPIError
+from app.storage.repositories import RuntimeSettingsRepository, SourceRepository
+from app.telegram_auth import TelegramAuthService
 from app.vk.service import VKService
 
 logger = logging.getLogger(__name__)
@@ -55,8 +65,12 @@ async def settings_callback(query: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "menu:alerts")
-async def alerts_callback(query: CallbackQuery) -> None:
-    await _edit(query, "<b>Алерты</b>\n\nВыбери, какие алерты включить или выключить:", alerts_keyboard())
+async def alerts_callback(
+    query: CallbackQuery,
+    runtime_settings_repo: RuntimeSettingsRepository,
+    settings: Settings,
+) -> None:
+    await _edit(query, await _alerts_text(runtime_settings_repo, settings), alerts_keyboard())
 
 
 @router.callback_query(F.data == "vk:menu")
@@ -138,7 +152,8 @@ async def vk_dashboard_callback(query: CallbackQuery, vk_service: VKService) -> 
 @router.callback_query(F.data == "tg:status")
 async def tg_status_callback(query: CallbackQuery, module_registry: ModuleRegistry) -> None:
     info = await module_registry.telegram_info()
-    await _edit(query, unavailable_text(info) if not info.is_available else "Telegram Monitor: ok", telegram_menu_keyboard(info.is_available))
+    text = unavailable_text(info) if not info.is_available else "Telegram Monitor: ok"
+    await _edit(query, text, telegram_menu_keyboard(info.is_available))
 
 
 @router.callback_query(F.data == "tg:sources")
@@ -153,7 +168,11 @@ async def tg_sources_callback(
         return
     sources = await source_repo.list_sources()
     if not sources:
-        await _edit(query, "Telegram sources: no data. Use /add_source <username>.", telegram_menu_keyboard(True))
+        await _edit(
+            query,
+            "Telegram sources: no data. Use /add_source <username>.",
+            telegram_menu_keyboard(True),
+        )
         return
     lines = ["<b>Telegram sources</b>"]
     lines.extend(f"#{source.id} {source.display_name}" for source in sources)
@@ -169,7 +188,8 @@ async def tg_dashboard_callback(query: CallbackQuery, module_registry: ModuleReg
     period = (query.data or "").split(":")[-1]
     await _edit(
         query,
-        f"Telegram dashboard за {period}: выбери source_id командой /tg_dashboard <source_id> {period}.",
+        f"Telegram dashboard за {period}: "
+        f"выбери source_id командой /tg_dashboard <source_id> {period}.",
         telegram_menu_keyboard(True),
     )
 
@@ -188,12 +208,20 @@ async def tg_watch_on_callback(query: CallbackQuery, module_registry: ModuleRegi
 
 @router.callback_query(F.data == "confirm:disable_vk")
 async def confirm_disable_vk(query: CallbackQuery) -> None:
-    await _edit(query, "Вы уверены, что хотите выключить VK Monitor?", confirm_keyboard("disable_vk"))
+    await _edit(
+        query,
+        "Вы уверены, что хотите выключить VK Monitor?",
+        confirm_keyboard("disable_vk"),
+    )
 
 
 @router.callback_query(F.data == "confirm:disable_tg")
 async def confirm_disable_tg(query: CallbackQuery) -> None:
-    await _edit(query, "Вы уверены, что хотите выключить Telegram Monitor?", confirm_keyboard("disable_tg"))
+    await _edit(
+        query,
+        "Вы уверены, что хотите выключить Telegram Monitor?",
+        confirm_keyboard("disable_tg"),
+    )
 
 
 @router.callback_query(F.data == "do:disable_vk")
@@ -206,11 +234,6 @@ async def disable_vk_callback(query: CallbackQuery, module_registry: ModuleRegis
 async def disable_tg_callback(query: CallbackQuery, module_registry: ModuleRegistry) -> None:
     await module_registry.set_module_enabled("enable_telegram_monitor", False)
     await _edit(query, "Telegram Monitor выключен.", main_menu_keyboard())
-
-
-@router.callback_query(F.data.startswith("alerts:"))
-async def alerts_toggle_callback(query: CallbackQuery) -> None:
-    await query.answer("Настройка алертов сохранена для будущего расширения.", show_alert=True)
 
 
 @router.callback_query(F.data == "setup:start")
@@ -230,65 +253,118 @@ async def telegram_setup_callback(query: CallbackQuery, module_registry: ModuleR
         "Если TG_API_ID/TG_API_HASH пока нет, Bot UI всё равно работает.",
         "Telethon session создаётся локально, не через бота.",
     ]
-    await _edit(query, "\n".join(lines), telegram_menu_keyboard(False))
+    await _edit(query, "\n".join(lines), telegram_setup_keyboard(can_auth=True))
 
 
 @router.callback_query(F.data == "setup:vk")
 async def vk_setup_callback(query: CallbackQuery, state: FSMContext, vk_service: VKService) -> None:
-    config = await vk_service.effective_config()
     await state.clear()
-    await state.update_data(access_token=None)
-    if not config.group_token:
-        await state.set_state(VKSetupStates.waiting_token)
-        await _edit(
-            query,
-            await vk_service.config_summary()
-            + "\n\nОтправь VK_GROUP_TOKEN следующим сообщением.",
-            setup_cancel_keyboard(can_skip=False),
-        )
-        return
+    await _edit(query, await vk_service.config_summary(), vk_setup_keyboard())
 
+
+@router.callback_query(F.data == "setup:vk_gt")
+async def vk_setup_group_token_callback(
+    query: CallbackQuery,
+    state: FSMContext,
+    vk_service: VKService,
+) -> None:
+    await state.clear()
+    await state.set_state(VKSetupStates.waiting_group_token)
+    await _edit(
+        query,
+        await vk_service.config_summary() + "\n\nОтправь VK_GROUP_TOKEN следующим сообщением.",
+        setup_cancel_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "setup:vk_ut")
+async def vk_setup_user_token_callback(
+    query: CallbackQuery,
+    state: FSMContext,
+    vk_service: VKService,
+) -> None:
+    await state.clear()
+    await state.set_state(VKSetupStates.waiting_user_token)
+    await _edit(
+        query,
+        await vk_service.config_summary()
+        + "\n\nОтправь VK_USER_ACCESS_TOKEN следующим сообщением. Он нужен для /vk_sync истории.",
+        setup_cancel_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "setup:vk_gid")
+async def vk_setup_group_id_callback(
+    query: CallbackQuery,
+    state: FSMContext,
+    vk_service: VKService,
+) -> None:
+    await state.clear()
     await state.set_state(VKSetupStates.waiting_group_id)
     await _edit(
         query,
         await vk_service.config_summary() + "\n\nОтправь VK_GROUP_ID следующим сообщением.",
-        setup_cancel_keyboard(can_skip=config.group_id is not None),
+        setup_cancel_keyboard(),
     )
 
 
-@router.callback_query(F.data == "setup:skip")
-async def setup_skip_callback(query: CallbackQuery, state: FSMContext, vk_service: VKService) -> None:
-    current_state = await state.get_state()
-    if current_state == VKSetupStates.waiting_group_id.state:
-        await _finish_vk_setup(query, state, vk_service, group_id=None)
-        return
-    await query.answer("Сейчас нечего пропускать.", show_alert=True)
-
-
 @router.callback_query(F.data == "setup:cancel")
-async def setup_cancel_callback(query: CallbackQuery, state: FSMContext) -> None:
+async def setup_cancel_callback(
+    query: CallbackQuery,
+    state: FSMContext,
+    telegram_auth_service: TelegramAuthService,
+) -> None:
+    await telegram_auth_service.cancel(query.from_user.id)
     await state.clear()
     await _edit(query, "Настройка отменена.", main_menu_keyboard())
 
 
-@router.message(VKSetupStates.waiting_token)
-async def vk_setup_token_message(message: Message, state: FSMContext) -> None:
+@router.message(VKSetupStates.waiting_group_token)
+async def vk_setup_group_token_message(
+    message: Message,
+    state: FSMContext,
+    vk_service: VKService,
+) -> None:
     token = (message.text or "").strip()
     if not token:
         await message.answer("Токен пустой. Отправь VK_GROUP_TOKEN или нажми Отмена.")
         return
-    await state.update_data(access_token=token)
-    await state.set_state(VKSetupStates.waiting_group_id)
     with contextlib.suppress(Exception):
         await message.delete()
+    await vk_service.save_setup(group_token=token, user_access_token=None, group_id=None)
+    await state.clear()
     await message.answer(
-        "Токен получен и не будет показан обратно.\nТеперь отправь VK_GROUP_ID.",
-        reply_markup=setup_cancel_keyboard(can_skip=False),
+        "VK_GROUP_TOKEN сохранён и не будет показан обратно.",
+        reply_markup=vk_setup_keyboard(),
+    )
+
+
+@router.message(VKSetupStates.waiting_user_token)
+async def vk_setup_user_token_message(
+    message: Message,
+    state: FSMContext,
+    vk_service: VKService,
+) -> None:
+    token = (message.text or "").strip()
+    if not token:
+        await message.answer("Токен пустой. Отправь VK_USER_ACCESS_TOKEN или нажми Отмена.")
+        return
+    with contextlib.suppress(Exception):
+        await message.delete()
+    await vk_service.save_setup(group_token=None, user_access_token=token, group_id=None)
+    await state.clear()
+    await message.answer(
+        "VK_USER_ACCESS_TOKEN сохранён и не будет показан обратно.",
+        reply_markup=vk_setup_keyboard(),
     )
 
 
 @router.message(VKSetupStates.waiting_group_id)
-async def vk_setup_group_message(message: Message, state: FSMContext, vk_service: VKService) -> None:
+async def vk_setup_group_message(
+    message: Message,
+    state: FSMContext,
+    vk_service: VKService,
+) -> None:
     raw_group_id = (message.text or "").strip()
     try:
         group_id = abs(int(raw_group_id))
@@ -296,39 +372,61 @@ async def vk_setup_group_message(message: Message, state: FSMContext, vk_service
         await message.answer("VK_GROUP_ID должен быть числом. Например: 123456789.")
         return
 
-    await _finish_vk_setup(message, state, vk_service, group_id=group_id)
-
-
-async def _finish_vk_setup(
-    event: CallbackQuery | Message,
-    state: FSMContext,
-    vk_service: VKService,
-    *,
-    group_id: int | None,
-) -> None:
-    data = await state.get_data()
-    await vk_service.save_setup(access_token=data.get("access_token"), group_id=group_id)
+    await vk_service.save_setup(group_token=None, user_access_token=None, group_id=group_id)
     await state.clear()
-
     try:
         source = await vk_service.healthcheck()
-        text = "\n".join(
-            [
-                "<b>VK setup complete</b>",
-                f"Группа: {source.display_name}",
-                "Healthcheck: ok",
-            ]
-        )
-    except VKAPIError as exc:
-        text = f"VK settings saved, but healthcheck failed: {_safe_error(exc)}"
+        text = f"VK_GROUP_ID сохранён. Healthcheck ok: {source.display_name}"
     except Exception as exc:
-        logger.exception("VK setup healthcheck failed")
-        text = f"VK settings saved, but healthcheck failed: {_safe_error(exc)}"
+        text = f"VK_GROUP_ID сохранён, но healthcheck failed: {_safe_error(exc)}"
+    await message.answer(text, reply_markup=vk_setup_keyboard())
 
-    if isinstance(event, CallbackQuery):
-        await _edit(event, text, vk_menu_keyboard(True))
-    else:
-        await event.answer(text, reply_markup=vk_menu_keyboard(True))
+
+@router.callback_query(F.data == "tg:auth")
+async def tg_auth_callback(
+    query: CallbackQuery,
+    state: FSMContext,
+    telegram_auth_service: TelegramAuthService,
+) -> None:
+    await state.clear()
+    await _edit(
+        query,
+        telegram_auth_cli_text(telegram_auth_service.is_configured()),
+        telegram_setup_keyboard(can_auth=telegram_auth_service.is_configured()),
+    )
+
+
+@router.message(TelegramAuthStates.waiting_phone)
+@router.message(TelegramAuthStates.waiting_code)
+@router.message(TelegramAuthStates.waiting_password)
+async def tg_auth_legacy_message(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        telegram_auth_cli_text(configured=True),
+        reply_markup=telegram_setup_keyboard(can_auth=True),
+    )
+
+
+@router.callback_query(F.data.startswith("alerts:"))
+async def alerts_toggle_callback(
+    query: CallbackQuery,
+    runtime_settings_repo: RuntimeSettingsRepository,
+    settings: Settings,
+) -> None:
+    mapping = {
+        "alerts:vk_on": ("alerts_vk_enabled", True),
+        "alerts:vk_off": ("alerts_vk_enabled", False),
+        "alerts:posts_on": ("alerts_vk_posts_enabled", True),
+        "alerts:posts_off": ("alerts_vk_posts_enabled", False),
+        "alerts:comments_on": ("alerts_vk_comments_enabled", True),
+        "alerts:comments_off": ("alerts_vk_comments_enabled", False),
+    }
+    key, enabled = mapping.get(query.data, ("", True))
+    if not key:
+        await query.answer("Неизвестная настройка алертов.", show_alert=True)
+        return
+    await runtime_settings_repo.set(key, "true" if enabled else "false", is_secret=False)
+    await _edit(query, await _alerts_text(runtime_settings_repo, settings), alerts_keyboard())
 
 
 async def _edit(query: CallbackQuery, text: str, reply_markup=None) -> None:
@@ -352,3 +450,33 @@ def _safe_error(exc: Exception) -> str:
     if len(text) > 300:
         return f"{text[:297]}..."
     return text
+
+
+async def _alerts_text(runtime_settings_repo: RuntimeSettingsRepository, settings: Settings) -> str:
+    vk_enabled = await runtime_settings_repo.get_bool(
+        "alerts_vk_enabled",
+        settings.alerts_vk_enabled,
+    )
+    posts_enabled = await runtime_settings_repo.get_bool(
+        "alerts_vk_posts_enabled",
+        settings.alerts_vk_posts_enabled,
+    )
+    comments_enabled = await runtime_settings_repo.get_bool(
+        "alerts_vk_comments_enabled",
+        settings.alerts_vk_comments_enabled,
+    )
+    return "\n".join(
+        [
+            "<b>Алерты</b>",
+            "",
+            f"VK alerts: {_flag(vk_enabled)}",
+            f"Новые посты: {_flag(posts_enabled)}",
+            f"Новые комментарии: {_flag(comments_enabled)}",
+            "",
+            "Выбери, что включить или выключить:",
+        ]
+    )
+
+
+def _flag(value: bool) -> str:
+    return "on" if value else "off"

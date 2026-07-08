@@ -51,6 +51,9 @@ class Settings(BaseSettings):
 
     database_path: Path = Path("data/argus.sqlite3")
     alert_chat_id: int | None = None
+    alerts_vk_enabled: bool = True
+    alerts_vk_posts_enabled: bool = True
+    alerts_vk_comments_enabled: bool = True
 
     poll_interval_seconds: int = 60
     source_sync_pause_seconds: float = 2.0

@@ -7,16 +7,24 @@ from aiogram.exceptions import TelegramAPIError
 
 from app.config import Settings
 from app.storage.models import Post, Source, VkComment, VkPost
-from app.storage.repositories import AlertRepository
+from app.storage.repositories import AlertRepository, RuntimeSettingsRepository
 
 logger = logging.getLogger(__name__)
 
 
 class AlertService:
-    def __init__(self, *, bot: Bot, settings: Settings, alerts: AlertRepository) -> None:
+    def __init__(
+        self,
+        *,
+        bot: Bot,
+        settings: Settings,
+        alerts: AlertRepository,
+        runtime_settings: RuntimeSettingsRepository | None = None,
+    ) -> None:
         self.bot = bot
         self.settings = settings
         self.alerts = alerts
+        self.runtime_settings = runtime_settings
 
     async def send_new_post_alert(self, source: Source, post: Post) -> None:
         targets = [self.settings.alert_chat_id] if self.settings.alert_chat_id else self.settings.admin_ids
@@ -69,6 +77,8 @@ class AlertService:
         return "\n".join(lines)
 
     async def send_vk_post_alert(self, post: VkPost) -> None:
+        if not await self._vk_alert_enabled("post"):
+            return
         message = self._render_vk_post(post)
         await self._send_platform_alert(
             platform="vk",
@@ -80,6 +90,8 @@ class AlertService:
         )
 
     async def send_vk_comment_alert(self, comment: VkComment) -> None:
+        if not await self._vk_alert_enabled("comment"):
+            return
         message = self._render_vk_comment(comment)
         await self._send_platform_alert(
             platform="vk",
@@ -150,6 +162,23 @@ class AlertService:
         if post.url:
             lines.append(f"Ссылка: {escape(post.url)}")
         return "\n".join(lines)
+
+    async def _vk_alert_enabled(self, item_type: str) -> bool:
+        if self.runtime_settings is None:
+            return self.settings.alerts_vk_enabled
+        if not await self.runtime_settings.get_bool("alerts_vk_enabled", self.settings.alerts_vk_enabled):
+            return False
+        if item_type == "post":
+            return await self.runtime_settings.get_bool(
+                "alerts_vk_posts_enabled",
+                self.settings.alerts_vk_posts_enabled,
+            )
+        if item_type == "comment":
+            return await self.runtime_settings.get_bool(
+                "alerts_vk_comments_enabled",
+                self.settings.alerts_vk_comments_enabled,
+            )
+        return True
 
     def _render_vk_comment(self, comment: VkComment) -> str:
         text = (comment.text or "").replace("\n", " ").strip()
