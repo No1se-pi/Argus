@@ -33,8 +33,10 @@ from app.bot.screens import (
     unavailable_text,
 )
 from app.bot.states import TelegramAuthStates, TelegramSourceSetupStates, VKSetupStates
+from app.collectors.telegram import LargeFloodWait, TelegramCollector, TelegramSourceError
 from app.config import Settings
 from app.modules import ModuleRegistry, ModuleStatus
+from app.storage.models import Source
 from app.storage.repositories import (
     RuntimeSettingsRepository,
     SourceRepository,
@@ -282,6 +284,7 @@ async def tg_source_mode_callback(
     query: CallbackQuery,
     state: FSMContext,
     source_repo: SourceRepository,
+    collector: TelegramCollector | None,
 ) -> None:
     mode = (query.data or "").split(":", maxsplit=1)[-1]
     if mode not in {"posts", "discussion"}:
@@ -308,6 +311,11 @@ async def tg_source_mode_callback(
         entity_type=str(data["entity_type"]),
         monitor_mode=mode,
     )
+    baseline_text = (
+        await _initialize_source_baseline(collector, source)
+        if collector is not None
+        else "Baseline не выставлен: Telethon client is not running."
+    )
     await state.clear()
     await _edit(
         query,
@@ -317,7 +325,7 @@ async def tg_source_mode_callback(
                 f"ID: {source.id}",
                 f"Название: {escape(source.display_name)}",
                 f"Режим: {source.telegram_monitor_mode}",
-                "Первый sync сохранит baseline и не пришлёт старые алерты.",
+                baseline_text,
             ]
         ),
         telegram_menu_keyboard(True),
@@ -665,6 +673,33 @@ def _callback_int_tail(data: str | None) -> int | None:
         return int(data.rsplit(":", maxsplit=1)[-1])
     except ValueError:
         return None
+
+
+async def _initialize_source_baseline(
+    collector: TelegramCollector,
+    source: Source,
+) -> str:
+    try:
+        if source.telegram_monitor_mode == "discussion":
+            result = await collector.sync_discussion(source, limit=1)
+        else:
+            result = await collector.sync_posts(source, limit=1)
+    except (TelegramSourceError, LargeFloodWait) as exc:
+        return f"Baseline не выставлен: {_safe_error(exc)}"
+
+    if result.fetched_count == 0 and result.last_message_id is None:
+        return "Baseline не выставлен: в источнике пока нет сообщений."
+    if result.initialized:
+        return (
+            f"Baseline выставлен: last_message_id={result.last_message_id}. "
+            "Старые сообщения не алертятся."
+        )
+    if result.saved_count:
+        return (
+            f"Sync выполнен: fetched={result.fetched_count}, "
+            f"saved={result.saved_count}, last_message_id={result.last_message_id}."
+        )
+    return f"Baseline уже был: last_message_id={result.last_message_id}."
 
 
 async def _edit(query: CallbackQuery, text: str, reply_markup=None) -> None:

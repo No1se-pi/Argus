@@ -37,6 +37,8 @@ class BackgroundScheduler:
         self.runtime_settings = runtime_settings
         self.keywords = keywords
         self._stop_event = asyncio.Event()
+        self._logged_disabled = False
+        self._logged_no_sources = False
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -60,9 +62,20 @@ class BackgroundScheduler:
 
     async def run_once(self) -> None:
         if not await self._telegram_monitor_enabled():
+            if not self._logged_disabled:
+                logger.info("Telegram scheduler skipped: monitor is disabled")
+                self._logged_disabled = True
             return
 
+        self._logged_disabled = False
         active_sources = await self.sources.list_sources()
+        if not active_sources:
+            if not self._logged_no_sources:
+                logger.info("Telegram scheduler has no active sources")
+                self._logged_no_sources = True
+            return
+
+        self._logged_no_sources = False
         for source in active_sources:
             try:
                 if source.telegram_monitor_mode == "discussion":
@@ -83,6 +96,15 @@ class BackgroundScheduler:
         if await self._is_deferred(self._defer_key(source.id, "posts")):
             return
         result = await self.collector.sync_posts(source)
+        logger.info(
+            "Telegram source %s posts sync: initialized=%s fetched=%s saved=%s new=%s last_message_id=%s",
+            source.id,
+            result.initialized,
+            result.fetched_count,
+            result.saved_count,
+            len(result.new_posts),
+            result.last_message_id,
+        )
         fresh_source = await self.sources.get_source(source.id) or source
         for post in result.new_posts:
             await self.alerts.send_new_post_alert(fresh_source, post)
@@ -96,6 +118,15 @@ class BackgroundScheduler:
         if await self._is_deferred(self._defer_key(source.id, "discussion")):
             return
         result = await self.collector.sync_discussion(source)
+        logger.info(
+            "Telegram source %s discussion sync: initialized=%s fetched=%s saved=%s new=%s last_message_id=%s",
+            source.id,
+            result.initialized,
+            result.fetched_count,
+            result.saved_count,
+            len(result.new_messages),
+            result.last_message_id,
+        )
         if result.initialized or not result.new_messages:
             return
         fresh_source = await self.sources.get_source(source.id) or source

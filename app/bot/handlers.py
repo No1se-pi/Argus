@@ -503,6 +503,7 @@ async def add_source_command(
         await message.answer(_format_error(exc))
         return
 
+    baseline_text = await _initialize_source_baseline(collector, source)
     await message.answer(
         "\n".join(
             [
@@ -510,6 +511,7 @@ async def add_source_command(
                 f"ID: {source.id}",
                 f"Название: {escape(source.display_name)}",
                 "Автоматическая подписка не выполнялась.",
+                *([baseline_text] if baseline_text else []),
             ]
         )
     )
@@ -750,6 +752,33 @@ async def _ensure_telegram_available(message: Message, module_registry: ModuleRe
     reason = f"\nПричина: {escape(info.reason)}" if info.reason else ""
     await message.answer(f"Telegram Monitor сейчас недоступен.{reason}")
     return False
+
+
+async def _initialize_source_baseline(
+    collector: TelegramCollector,
+    source: Source,
+) -> str | None:
+    try:
+        if source.telegram_monitor_mode == "discussion":
+            result = await collector.sync_discussion(source, limit=1)
+        else:
+            result = await collector.sync_posts(source, limit=1)
+    except (TelegramSourceError, LargeFloodWait) as exc:
+        return f"Baseline не выставлен: {_format_error(exc)}"
+
+    if result.fetched_count == 0 and result.last_message_id is None:
+        return "Baseline не выставлен: в источнике пока нет сообщений."
+    if result.initialized:
+        return (
+            f"Baseline выставлен: last_message_id={result.last_message_id}. "
+            "Старые сообщения не алертятся."
+        )
+    if result.saved_count:
+        return (
+            f"Sync выполнен: fetched={result.fetched_count}, "
+            f"saved={result.saved_count}, last_message_id={result.last_message_id}."
+        )
+    return f"Baseline уже был: last_message_id={result.last_message_id}."
 
 
 def _single_argument(command: CommandObject) -> str | None:

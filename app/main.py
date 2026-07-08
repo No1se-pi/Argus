@@ -158,6 +158,7 @@ async def _start_telegram_monitor(
             raise
         return None, None
 
+    logger.info("Telegram Monitor connected with session: %s", settings.telethon_session_file)
     rate_limiter = TelegramRateLimiter(min_delay_seconds=settings.source_sync_pause_seconds)
     collector = TelegramCollector(
         client=telegram_client,
