@@ -13,7 +13,10 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="✈️ Telegram", callback_data="tg:menu"),
             ],
             [
+                InlineKeyboardButton(text="⭐ Отзывы", callback_data="reviews:menu"),
                 InlineKeyboardButton(text="🧩 Модули", callback_data="menu:modules"),
+            ],
+            [
                 InlineKeyboardButton(text="⚙️ Настройка", callback_data="menu:settings"),
             ],
             [InlineKeyboardButton(text="🩺 Статус", callback_data="menu:status")],
@@ -269,5 +272,35 @@ def confirm_keyboard(action: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="✅ Да", callback_data=f"do:{action}"),
                 InlineKeyboardButton(text="❌ Нет", callback_data="menu:main"),
             ]
+        ]
+    )
+
+
+def reviews_menu_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    toggle_text = "🔴 Выключить мониторинг" if enabled else "🟢 Включить мониторинг"
+    toggle_action = "reviews:off" if enabled else "reviews:on"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔄 Проверить сейчас", callback_data="reviews:sync"),
+                InlineKeyboardButton(text="📋 Филиалы (12)", callback_data="reviews:sources"),
+            ],
+            [
+                InlineKeyboardButton(text=toggle_text, callback_data=toggle_action),
+            ],
+            [
+                InlineKeyboardButton(text="🩺 Статус", callback_data="reviews:status"),
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"),
+            ],
+        ]
+    )
+
+
+def reviews_sources_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="reviews:sources")],
+            [InlineKeyboardButton(text="⬅️ Меню отзывов", callback_data="reviews:menu")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
         ]
     )

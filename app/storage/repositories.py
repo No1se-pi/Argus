@@ -1,6 +1,13 @@
-from datetime import datetime, timezone
+from datetime import datetime
+
+try:
+    from datetime import UTC
+except ImportError:
+    from datetime import timezone
+    UTC = timezone.utc  # noqa: UP017
 
 from app.analytics.dashboard import DashboardService
+from app.reviews.models import ReviewItem, ReviewPlatform, ReviewSource
 from app.storage.database import Database
 from app.storage.models import (
     Comment,
@@ -12,8 +19,6 @@ from app.storage.models import (
     VkPost,
     VkSource,
 )
-
-UTC = timezone.utc
 
 
 def utc_now_iso() -> str:
@@ -739,6 +744,15 @@ class RuntimeSettingsRepository:
             return default
         return value.strip().lower() in {"1", "true", "yes", "on"}
 
+    async def get_int(self, key: str, default: int) -> int:
+        value = await self.get(key)
+        if value is None:
+            return default
+        try:
+            return int(value.strip())
+        except ValueError:
+            return default
+
     async def set(self, key: str, value: str, *, is_secret: bool = False) -> None:
         connection = self.database.require_connection()
         await connection.execute(
@@ -1102,6 +1116,367 @@ class VkRepository:
         return int(row["count"])
 
 
+class ReviewRepository:
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    def _row_to_source(self, row) -> ReviewSource:
+        return ReviewSource(
+            id=int(row["id"]),
+            platform=ReviewPlatform(row["platform"]),
+            branch_name=str(row["branch_name"]),
+            external_id=str(row["external_id"]),
+            url=str(row["url"]),
+            is_active=bool(row["is_active"]),
+            is_initialized=bool(row["is_initialized"]),
+            last_status=str(row["last_status"]),
+            last_checked_at=row["last_checked_at"],
+            last_success_at=row["last_success_at"],
+            last_error=row["last_error"],
+            consecutive_errors=int(row["consecutive_errors"]),
+            health_alert_active=int(row["health_alert_active"])
+            if "health_alert_active" in row.keys()
+            else 0,
+            health_alert_sent_at=row["health_alert_sent_at"]
+            if "health_alert_sent_at" in row.keys()
+            else None,
+            backoff_until=row["backoff_until"],
+            last_rating=float(row["last_rating"]) if row["last_rating"] is not None else None,
+            total_reviews_count=int(row["total_reviews_count"])
+            if row["total_reviews_count"] is not None
+            else None,
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _row_to_review(self, row) -> ReviewItem:
+        branch_name = row["branch_name"] if "branch_name" in row.keys() else ""
+        source_id = (
+            int(row["source_id"])
+            if "source_id" in row.keys() and row["source_id"] is not None
+            else None
+        )
+        return ReviewItem(
+            id=int(row["id"]),
+            source_id=source_id,
+            external_review_id=str(row["external_review_id"]),
+            platform=ReviewPlatform(row["platform"]),
+            branch_name=branch_name,
+            author_name=str(row["author_name"] or "Аноним"),
+            rating=int(row["rating"]) if row["rating"] is not None else 0,
+            text=str(row["text"] or ""),
+            published_at=str(row["published_at"] or ""),
+            edited_at=row["edited_at"] if "edited_at" in row.keys() else None,
+            review_url=row["review_url"] if "review_url" in row.keys() else None,
+            raw_payload_json=row["raw_payload_json"] if "raw_payload_json" in row.keys() else None,
+            telegram_parts_total=int(row["telegram_parts_total"])
+            if "telegram_parts_total" in row.keys()
+            else 1,
+            telegram_parts_sent=int(row["telegram_parts_sent"])
+            if "telegram_parts_sent" in row.keys()
+            else 0,
+            is_sent_to_telegram=bool(row["is_sent_to_telegram"])
+            if "is_sent_to_telegram" in row.keys()
+            else False,
+            telegram_sent_at=row["telegram_sent_at"] if "telegram_sent_at" in row.keys() else None,
+            last_delivery_error=row["last_delivery_error"]
+            if "last_delivery_error" in row.keys()
+            else None,
+        )
+
+    async def ensure_default_sources(self, sources: list[dict]) -> int:
+        connection = self.database.require_connection()
+        now = utc_now_iso()
+        count = 0
+        for s in sources:
+            platform_val = (
+                s["platform"].value if hasattr(s["platform"], "value") else str(s["platform"])
+            )
+            async with connection.execute(
+                """
+                INSERT INTO review_sources (
+                    platform, branch_name, external_id, url, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, external_id) DO UPDATE SET
+                    branch_name = excluded.branch_name,
+                    url = excluded.url,
+                    updated_at = excluded.updated_at
+                """,
+                (platform_val, s["branch_name"], str(s["external_id"]), s["url"], now, now),
+            ) as cursor:
+                count += cursor.rowcount
+        await connection.commit()
+        return count
+
+    async def list_sources(self, only_active: bool = False) -> list[ReviewSource]:
+        connection = self.database.require_connection()
+        query = "SELECT * FROM review_sources"
+        if only_active:
+            query += " WHERE is_active = 1"
+        query += " ORDER BY id"
+        async with connection.execute(query) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_source(row) for row in rows]
+
+    async def get_source_by_id(self, source_id: int) -> ReviewSource | None:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            "SELECT * FROM review_sources WHERE id = ?",
+            (source_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_source(row) if row is not None else None
+
+    async def get_source_by_external_id(
+        self, platform: str, external_id: str
+    ) -> ReviewSource | None:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            "SELECT * FROM review_sources WHERE platform = ? AND external_id = ?",
+            (str(platform), str(external_id)),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_source(row) if row is not None else None
+
+    async def set_source_active(self, source_id: int, is_active: bool) -> None:
+        connection = self.database.require_connection()
+        now = utc_now_iso()
+        await connection.execute(
+            "UPDATE review_sources SET is_active = ?, updated_at = ? WHERE id = ?",
+            (1 if is_active else 0, now, source_id),
+        )
+        await connection.commit()
+
+    async def mark_source_initialized(self, source_id: int) -> None:
+        connection = self.database.require_connection()
+        now = utc_now_iso()
+        await connection.execute(
+            "UPDATE review_sources SET is_initialized = 1, updated_at = ? WHERE id = ?",
+            (now, source_id),
+        )
+        await connection.commit()
+
+    async def update_source_status(
+        self,
+        source_id: int,
+        *,
+        status: str,
+        checked_at: str,
+        success: bool,
+        error: str | None = None,
+        consecutive_errors: int | None = None,
+        health_alert_active: int | None = None,
+        health_alert_sent_at: str | None = None,
+        backoff_until: str | None = None,
+        last_rating: float | None = None,
+        total_reviews_count: int | None = None,
+    ) -> None:
+        connection = self.database.require_connection()
+        now = utc_now_iso()
+        fields = ["last_status = ?", "last_checked_at = ?", "updated_at = ?"]
+        params: list[object] = [status, checked_at, now]
+
+        if success:
+            fields.append("last_success_at = ?")
+            params.append(checked_at)
+            fields.append("last_error = NULL")
+        else:
+            fields.append("last_error = ?")
+            params.append(error or "Unknown error")
+
+        if consecutive_errors is not None:
+            fields.append("consecutive_errors = ?")
+            params.append(consecutive_errors)
+
+        if health_alert_active is not None:
+            fields.append("health_alert_active = ?")
+            params.append(health_alert_active)
+
+        if health_alert_sent_at is not None:
+            fields.append("health_alert_sent_at = ?")
+            params.append(health_alert_sent_at)
+        elif success and health_alert_active == 0:
+            fields.append("health_alert_sent_at = NULL")
+
+        if backoff_until is not None:
+            fields.append("backoff_until = ?")
+            params.append(backoff_until)
+        elif success:
+            fields.append("backoff_until = NULL")
+
+        if last_rating is not None:
+            fields.append("last_rating = ?")
+            params.append(last_rating)
+
+        if total_reviews_count is not None:
+            fields.append("total_reviews_count = ?")
+            params.append(total_reviews_count)
+
+        params.append(source_id)
+        query = f"UPDATE review_sources SET {', '.join(fields)} WHERE id = ?"
+        await connection.execute(query, tuple(params))
+        await connection.commit()
+
+    async def is_review_known(self, platform: str, external_review_id: str) -> bool:
+        connection = self.database.require_connection()
+        platform_val = platform.value if hasattr(platform, "value") else str(platform)
+        async with connection.execute(
+            "SELECT 1 FROM reviews WHERE platform = ? AND external_review_id = ? LIMIT 1",
+            (platform_val, str(external_review_id)),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row is not None
+
+    async def save_reviews(
+        self,
+        reviews: list[ReviewItem],
+        source_id: int,
+        *,
+        mark_sent: bool = False,
+    ) -> int:
+        connection = self.database.require_connection()
+        now = utc_now_iso()
+        inserted_count = 0
+        for r in reviews:
+            platform_val = r.platform.value if hasattr(r.platform, "value") else str(r.platform)
+            is_sent_val = 1 if mark_sent else 0
+            sent_at_val = now if mark_sent else None
+            async with connection.execute(
+                """
+                INSERT OR IGNORE INTO reviews (
+                    source_id, platform, external_review_id, author_name,
+                    rating, text, published_at, edited_at, review_url,
+                    content_hash, first_seen_at, updated_at,
+                    telegram_parts_total, telegram_parts_sent,
+                    is_sent_to_telegram, telegram_sent_at, raw_payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_id,
+                    platform_val,
+                    str(r.external_review_id),
+                    r.author_name,
+                    r.rating,
+                    r.text,
+                    r.published_at,
+                    r.edited_at,
+                    r.review_url,
+                    None,
+                    now,
+                    now,
+                    r.telegram_parts_total,
+                    r.telegram_parts_sent if not mark_sent else r.telegram_parts_total,
+                    is_sent_val,
+                    sent_at_val,
+                    r.raw_payload_json,
+                ),
+            ) as cursor:
+                if cursor.rowcount > 0:
+                    inserted_count += 1
+        await connection.commit()
+        return inserted_count
+
+    async def get_unsent_reviews(self, limit: int = 50) -> list[ReviewItem]:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT r.*, s.branch_name
+            FROM reviews r
+            JOIN review_sources s ON r.source_id = s.id
+            WHERE r.is_sent_to_telegram = 0
+            ORDER BY r.published_at ASC, r.id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_review(row) for row in rows]
+
+    async def update_delivery_progress(
+        self,
+        review_id: int,
+        *,
+        parts_sent: int,
+        parts_total: int,
+        is_sent: bool,
+        error: str | None = None,
+        raw_payload_json: str | None = None,
+    ) -> None:
+        connection = self.database.require_connection()
+        now = utc_now_iso()
+        if is_sent:
+            await connection.execute(
+                """
+                UPDATE reviews
+                SET telegram_parts_sent = ?,
+                    telegram_parts_total = ?,
+                    is_sent_to_telegram = 1,
+                    telegram_sent_at = ?,
+                    last_delivery_error = NULL,
+                    raw_payload_json = COALESCE(?, raw_payload_json),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (parts_sent, parts_total, now, raw_payload_json, now, review_id),
+            )
+        else:
+            await connection.execute(
+                """
+                UPDATE reviews
+                SET telegram_parts_sent = ?,
+                    telegram_parts_total = ?,
+                    last_delivery_error = ?,
+                    raw_payload_json = COALESCE(?, raw_payload_json),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (parts_sent, parts_total, error, raw_payload_json, now, review_id),
+            )
+        await connection.commit()
+
+    async def get_recent_reviews(self, limit: int = 10) -> list[ReviewItem]:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT r.*, s.branch_name
+            FROM reviews r
+            JOIN review_sources s ON r.source_id = s.id
+            ORDER BY r.published_at DESC, r.id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_review(row) for row in rows]
+
+    async def get_stats(self) -> dict:
+        connection = self.database.require_connection()
+        async with connection.execute("SELECT COUNT(*) AS c FROM review_sources") as cur:
+            total_sources = int((await cur.fetchone())["c"])
+        async with connection.execute(
+            "SELECT COUNT(*) AS c FROM review_sources WHERE is_active = 1"
+        ) as cur:
+            active_sources = int((await cur.fetchone())["c"])
+        async with connection.execute(
+            "SELECT COUNT(*) AS c FROM review_sources WHERE health_alert_active = 1"
+        ) as cur:
+            degraded_sources = int((await cur.fetchone())["c"])
+        async with connection.execute("SELECT COUNT(*) AS c FROM reviews") as cur:
+            total_reviews = int((await cur.fetchone())["c"])
+        async with connection.execute(
+            "SELECT COUNT(*) AS c FROM reviews WHERE is_sent_to_telegram = 0"
+        ) as cur:
+            unsent_reviews = int((await cur.fetchone())["c"])
+        return {
+            "total_sources": total_sources,
+            "active_sources": active_sources,
+            "degraded_sources": degraded_sources,
+            "total_reviews": total_reviews,
+            "unsent_reviews": unsent_reviews,
+        }
+
+
 class RepositoryBundle:
     def __init__(self, database: Database) -> None:
         self.database = database
@@ -1115,6 +1490,7 @@ class RepositoryBundle:
         self.scheduler_state = SchedulerStateRepository(database)
         self.runtime_settings = RuntimeSettingsRepository(database)
         self.vk = VkRepository(database)
+        self.reviews = ReviewRepository(database)
 
     def dashboard_service(self) -> DashboardService:
         return DashboardService(

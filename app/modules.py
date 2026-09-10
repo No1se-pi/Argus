@@ -4,7 +4,7 @@ from enum import Enum
 try:
     from enum import StrEnum
 except ImportError:
-    class StrEnum(str, Enum):
+    class StrEnum(str, Enum):  # noqa: UP042
         pass
 
 from app.config import Settings
@@ -47,16 +47,21 @@ class ModuleRegistry:
         runtime_settings,
         vk_service=None,
         telegram_collector=None,
+        reviews_service=None,
+        reviews_scheduler=None,
     ) -> None:
         self.settings = settings
         self.runtime_settings = runtime_settings
         self.vk_service = vk_service
         self.telegram_collector = telegram_collector
+        self.reviews_service = reviews_service
+        self.reviews_scheduler = reviews_scheduler
 
     async def module_infos(self, *, check_network: bool = False) -> list[ModuleInfo]:
         return [
             await self.vk_info(check_network=check_network),
             await self.telegram_info(),
+            await self.reviews_info(),
         ]
 
     async def vk_info(self, *, check_network: bool = False) -> ModuleInfo:
@@ -229,6 +234,69 @@ class ModuleRegistry:
         if key not in {"enable_vk_monitor", "enable_telegram_monitor"}:
             raise ValueError("Unknown module setting.")
         await self.runtime_settings.set(key, "true" if enabled else "false", is_secret=False)
+
+
+    async def reviews_info(self) -> ModuleInfo:
+        commands = [
+            "/reviews",
+            "/reviews_status",
+            "/reviews_sync",
+            "/reviews_on",
+            "/reviews_off",
+        ]
+        if self.reviews_service is None:
+            return ModuleInfo(
+                name="Reviews Monitor",
+                enabled=False,
+                status=ModuleStatus.DISABLED,
+                reason="Reviews service is not initialized",
+                available_commands=[],
+            )
+
+        config = await self.reviews_service.effective_config()
+        if not config.enabled:
+            return ModuleInfo(
+                name="Reviews Monitor",
+                enabled=False,
+                status=ModuleStatus.DISABLED,
+                reason="Reviews Monitor is disabled",
+                available_commands=["/reviews_on"],
+            )
+
+        if self.reviews_scheduler is not None:
+            sched_status = await self.reviews_scheduler.get_status()
+            health = sched_status.get("health_status", "HEALTHY")
+            if health in ("DEGRADED_STALE", "UNHEALTHY_CRASHING"):
+                return ModuleInfo(
+                    name="Reviews Monitor",
+                    enabled=True,
+                    status=ModuleStatus.ERROR,
+                    reason=f"Scheduler degraded: {health}",
+                    available_commands=commands,
+                )
+
+        if (
+            hasattr(self.reviews_service, "repository")
+            and self.reviews_service.repository is not None
+        ):
+            stats = await self.reviews_service.repository.get_stats()
+            degraded_count = stats.get("degraded_sources", 0)
+            if degraded_count > 0:
+                return ModuleInfo(
+                    name="Reviews Monitor",
+                    enabled=True,
+                    status=ModuleStatus.ERROR,
+                    reason=f"Sources degraded: {degraded_count}",
+                    available_commands=commands,
+                )
+
+        return ModuleInfo(
+            name="Reviews Monitor",
+            enabled=True,
+            status=ModuleStatus.OK,
+            reason="",
+            available_commands=commands,
+        )
 
     async def _runtime_bool(self, key: str, default: bool) -> bool:
         value = await self.runtime_settings.get(key)

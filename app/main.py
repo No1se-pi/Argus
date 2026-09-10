@@ -14,6 +14,8 @@ from app.collectors.telegram import TelegramCollector
 from app.config import get_settings
 from app.logging import setup_logging
 from app.modules import ModuleRegistry
+from app.reviews.scheduler import ReviewsPollingScheduler
+from app.reviews.service import ReviewsService
 from app.scheduler.jobs import BackgroundScheduler
 from app.scheduler.rate_limit import TelegramRateLimiter
 from app.storage.database import Database
@@ -52,11 +54,23 @@ async def main() -> None:
         runtime_settings=repositories.runtime_settings,
         repository=repositories.vk,
     )
+    reviews_service = ReviewsService(
+        settings=settings,
+        runtime_settings=repositories.runtime_settings,
+        repository=repositories.reviews,
+        alerts=alert_service,
+    )
+    reviews_scheduler = ReviewsPollingScheduler(
+        settings=settings,
+        service=reviews_service,
+    )
     module_registry = ModuleRegistry(
         settings=settings,
         runtime_settings=repositories.runtime_settings,
         vk_service=vk_service,
         telegram_collector=collector,
+        reviews_service=reviews_service,
+        reviews_scheduler=reviews_scheduler,
     )
     telegram_auth_service = TelegramAuthService(settings)
     access_service = AccessRequestService(settings)
@@ -75,6 +89,8 @@ async def main() -> None:
         telegram_auth_service=telegram_auth_service,
         keyword_repo=repositories.keywords,
         access_service=access_service,
+        reviews_service=reviews_service,
+        reviews_scheduler=reviews_scheduler,
     )
 
     schedulers = []
@@ -96,11 +112,16 @@ async def main() -> None:
     schedulers.append(vk_scheduler)
     tasks.append(asyncio.create_task(vk_scheduler.run(), name="argus-vk-scheduler"))
 
+    schedulers.append(reviews_scheduler)
+    tasks.append(asyncio.create_task(reviews_scheduler.run(), name="argus-reviews-scheduler"))
+
     logger.info("Argus started")
 
     try:
         with contextlib.suppress(asyncio.CancelledError):
-            await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
+            await dispatcher.start_polling(
+                bot, allowed_updates=dispatcher.resolve_used_update_types()
+            )
     finally:
         logger.info("Argus shutdown started")
         for scheduler in schedulers:
@@ -108,6 +129,8 @@ async def main() -> None:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await reviews_service.close()
         with contextlib.suppress(Exception, asyncio.CancelledError):
             await bot.session.close()
         if telegram_client is not None:

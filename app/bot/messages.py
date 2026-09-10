@@ -1,6 +1,5 @@
 from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, Message
 
-
 CAPTION_LIMIT = 1024
 
 

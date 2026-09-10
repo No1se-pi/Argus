@@ -76,7 +76,11 @@ class AccessRequestService:
         for line in lines:
             stripped = line.strip()
             if stripped.startswith("ADMIN_IDS=") or stripped.startswith("export ADMIN_IDS="):
-                prefix = "export ADMIN_IDS=" if stripped.startswith("export ADMIN_IDS=") else "ADMIN_IDS="
+                prefix = (
+                    "export ADMIN_IDS="
+                    if stripped.startswith("export ADMIN_IDS=")
+                    else "ADMIN_IDS="
+                )
                 updated_lines.append(f"{prefix}{value}")
                 replaced = True
             else:

@@ -23,7 +23,9 @@ class AdminOnlyMiddleware(BaseMiddleware):
             if isinstance(event, Message):
                 await self._handle_denied_message(event, data)
             elif isinstance(event, CallbackQuery):
-                await event.answer("Нет доступа. Отправь /request_access в чат с ботом.", show_alert=True)
+                await event.answer(
+                    "Нет доступа. Отправь /request_access в чат с ботом.", show_alert=True
+                )
             return None
         return await handler(event, data)
 

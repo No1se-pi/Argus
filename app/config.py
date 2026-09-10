@@ -6,11 +6,25 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
 
     enable_telegram_bot_ui: bool = True
     enable_vk_monitor: bool = True
     enable_telegram_monitor: bool = False
+    enable_reviews_monitor: bool = False
+
+    reviews_poll_interval_seconds: int = 900
+    reviews_request_pause_seconds: float = 3.0
+    reviews_fetch_page_size: int = 10
+    reviews_max_catchup_reviews: int = 50
+    reviews_error_alert_threshold: int = 3
+    reviews_max_backoff_seconds: int = 7200
+    alerts_reviews_enabled: bool = True
 
     fail_fast: bool = False
     require_vk: bool = False
