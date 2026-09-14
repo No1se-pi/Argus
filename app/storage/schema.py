@@ -1,6 +1,5 @@
 from app.storage.database import Database
 
-
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -194,6 +193,58 @@ CREATE TABLE IF NOT EXISTS vk_stats_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_vk_snapshots_group_checked
 ON vk_stats_snapshots(group_id, checked_at);
+
+CREATE TABLE IF NOT EXISTS review_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    branch_name TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    is_initialized INTEGER NOT NULL DEFAULT 0,
+    last_status TEXT NOT NULL DEFAULT 'PENDING',
+    last_checked_at TEXT,
+    last_success_at TEXT,
+    last_error TEXT,
+    consecutive_errors INTEGER NOT NULL DEFAULT 0,
+    health_alert_active INTEGER NOT NULL DEFAULT 0,
+    health_alert_sent_at TEXT,
+    backoff_until TEXT,
+    last_rating REAL,
+    total_reviews_count INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(platform, external_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_sources_active ON review_sources(is_active);
+
+CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL REFERENCES review_sources(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL,
+    external_review_id TEXT NOT NULL,
+    author_name TEXT,
+    rating INTEGER,
+    text TEXT,
+    published_at TEXT,
+    edited_at TEXT,
+    review_url TEXT,
+    content_hash TEXT,
+    first_seen_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    telegram_parts_total INTEGER NOT NULL DEFAULT 1,
+    telegram_parts_sent INTEGER NOT NULL DEFAULT 0,
+    is_sent_to_telegram INTEGER NOT NULL DEFAULT 0,
+    telegram_sent_at TEXT,
+    last_delivery_error TEXT,
+    raw_payload_json TEXT,
+    UNIQUE(platform, external_review_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reviews_source ON reviews(source_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_sent ON reviews(is_sent_to_telegram);
+CREATE INDEX IF NOT EXISTS idx_reviews_published ON reviews(published_at);
 """
 
 
@@ -202,6 +253,7 @@ async def init_schema(database: Database) -> None:
     await connection.executescript(SCHEMA_SQL)
     await _ensure_source_columns(database)
     await _ensure_alert_columns(database)
+    await _ensure_review_columns(database)
     await connection.commit()
 
 
@@ -279,3 +331,44 @@ async def _rebuild_alerts_table(database: Database) -> None:
     )
     await connection.execute("DROP TABLE alerts_old")
     await connection.execute("PRAGMA foreign_keys = ON")
+
+
+async def _ensure_review_columns(database: Database) -> None:
+    connection = database.require_connection()
+
+    # Verify review_sources columns
+    async with connection.execute("PRAGMA table_info(review_sources)") as cursor:
+        sources_cols = {row["name"] for row in await cursor.fetchall()}
+
+    if sources_cols:
+        sources_migrations = []
+        if "health_alert_active" not in sources_cols:
+            sources_migrations.append(
+                "ALTER TABLE review_sources "
+                "ADD COLUMN health_alert_active INTEGER NOT NULL DEFAULT 0"
+            )
+        if "health_alert_sent_at" not in sources_cols:
+            sources_migrations.append(
+                "ALTER TABLE review_sources ADD COLUMN health_alert_sent_at TEXT"
+            )
+        for stmt in sources_migrations:
+            await connection.execute(stmt)
+
+    # Verify reviews columns
+    async with connection.execute("PRAGMA table_info(reviews)") as cursor:
+        reviews_cols = {row["name"] for row in await cursor.fetchall()}
+
+    if reviews_cols:
+        reviews_migrations = []
+        if "telegram_parts_total" not in reviews_cols:
+            reviews_migrations.append(
+                "ALTER TABLE reviews ADD COLUMN telegram_parts_total INTEGER NOT NULL DEFAULT 1"
+            )
+        if "telegram_parts_sent" not in reviews_cols:
+            reviews_migrations.append(
+                "ALTER TABLE reviews ADD COLUMN telegram_parts_sent INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_delivery_error" not in reviews_cols:
+            reviews_migrations.append("ALTER TABLE reviews ADD COLUMN last_delivery_error TEXT")
+        for stmt in reviews_migrations:
+            await connection.execute(stmt)

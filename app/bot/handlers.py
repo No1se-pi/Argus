@@ -1,4 +1,5 @@
 from html import escape
+from typing import Any
 
 from aiogram import Router
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -9,6 +10,8 @@ from app.analytics.dashboard import DashboardService
 from app.analytics.periods import parse_period
 from app.bot.keyboards import (
     main_menu_keyboard,
+    reviews_menu_keyboard,
+    reviews_sources_keyboard,
     setup_cancel_keyboard,
     telegram_source_mode_keyboard,
     vk_setup_keyboard,
@@ -17,6 +20,8 @@ from app.bot.messages import answer_dashboard
 from app.bot.screens import (
     main_menu_text,
     modules_text,
+    reviews_menu_text,
+    reviews_sources_text,
     setup_text,
     status_text,
     telegram_auth_cli_text,
@@ -24,9 +29,11 @@ from app.bot.screens import (
 from app.bot.states import TelegramSourceSetupStates
 from app.collectors.telegram import LargeFloodWait, TelegramCollector, TelegramSourceError
 from app.modules import ModuleRegistry, ModuleStatus
+from app.reviews.models import ReviewsSyncAlreadyRunningError
 from app.storage.models import Post, Source, TelegramGroupMessage
 from app.storage.repositories import (
     PostRepository,
+    RuntimeSettingsRepository,
     SourceRepository,
     TelegramGroupMessageRepository,
     TelegramKeywordRepository,
@@ -173,7 +180,9 @@ async def vk_posts_command(
 ) -> None:
     args = (command.args or "").split()
     if not args:
-        await message.answer("Использование: /vk_posts &lt;period&gt; [limit], например /vk_posts 7d 10")
+        await message.answer(
+            "Использование: /vk_posts &lt;period&gt; [limit], например /vk_posts 7d 10"
+        )
         return
     try:
         limit = _limit_from_parts(args, index=1, default=10)
@@ -368,7 +377,9 @@ async def tg_recent_posts_command(
 
     if source.telegram_monitor_mode == "discussion":
         messages = await group_message_repo.list_recent(source_id, limit)
-        text = _render_tg_messages(source, messages, limit=limit, title="TG recent discussion messages")
+        text = _render_tg_messages(
+            source, messages, limit=limit, title="TG recent discussion messages"
+        )
     else:
         posts = await post_repo.list_recent(source_id, limit)
         text = _render_tg_posts(source, posts, limit=limit, title="TG recent posts")
@@ -856,12 +867,7 @@ def _source_id_argument(command: CommandObject) -> int | None:
 
 
 def _parse_int_token(value: str) -> int:
-    normalized = (
-        value.strip()
-        .replace("\u2212", "-")
-        .replace("\u2013", "-")
-        .replace("\u2014", "-")
-    )
+    normalized = value.strip().replace("\u2212", "-").replace("\u2013", "-").replace("\u2014", "-")
     return int(normalized)
 
 
@@ -943,7 +949,8 @@ def _render_tg_posts(
             "\n".join(
                 [
                     f"- {escape(post.date[:16])} · msg {post.telegram_message_id} · "
-                    f"views: {views}, reactions: {post.reactions_total}, comments: {post.comments_count}{url}",
+                    f"views: {views}, reactions: {post.reactions_total}, "
+                    f"comments: {post.comments_count}{url}",
                     f"  {escape(text)}",
                 ]
             )
@@ -1017,7 +1024,8 @@ async def _resolve_source_from_forward(message: Message, collector: TelegramColl
 
     raise TelegramSourceError(
         "Не вижу публичный origin пересланного сообщения. "
-        "Перешли сообщение из канала/группы без скрытого автора или используй /add_source &lt;link&gt;."
+        "Перешли сообщение из канала/группы без скрытого автора или "
+        "используй /add_source &lt;link&gt;."
     )
 
 
@@ -1028,3 +1036,94 @@ def _format_error(exc: Exception) -> str:
     if len(text) > 500:
         text = f"{text[:497]}..."
     return escape(text)
+
+
+@router.message(Command("reviews"))
+async def reviews_menu_command(
+    message: Message,
+    reviews_service: Any = None,
+    reviews_scheduler: Any = None,
+) -> None:
+    if reviews_service is None:
+        await message.answer("Reviews Monitor не инициализирован.")
+        return
+    config = await reviews_service.effective_config()
+    stats = await reviews_service.repository.get_stats()
+    sched_status = await reviews_scheduler.get_status() if reviews_scheduler else {}
+    text = await reviews_menu_text(stats, sched_status, config)
+    await message.answer(text, reply_markup=reviews_menu_keyboard(config.enabled))
+
+
+@router.message(Command("reviews_status"))
+async def reviews_status_command(
+    message: Message,
+    reviews_service: Any = None,
+    reviews_scheduler: Any = None,
+) -> None:
+    if reviews_service is None:
+        await message.answer("Reviews Monitor не инициализирован.")
+        return
+    sources = await reviews_service.repository.list_sources()
+    text = reviews_sources_text(sources)
+    await message.answer(text, reply_markup=reviews_sources_keyboard())
+
+
+@router.message(Command("reviews_sync"))
+async def reviews_sync_command(
+    message: Message,
+    reviews_service: Any = None,
+) -> None:
+    if reviews_service is None:
+        await message.answer("Reviews Monitor не инициализирован.")
+        return
+    config = await reviews_service.effective_config()
+    if not config.enabled:
+        await message.answer("Reviews Monitor выключен. Сначала включите мониторинг.")
+        return
+    status_msg = await message.answer("🔄 Запуск ручной проверки 12 филиалов...")
+    try:
+        results = await reviews_service.sync_all_sources(force=True)
+        new_revs = sum(len(r.new_reviews) for r in results)
+        errors = sum(1 for r in results if r.is_error)
+        await status_msg.edit_text(
+            f"✅ Проверка завершена.\n"
+            f"• Проверено филиалов: {len(results)}\n"
+            f"• Новых отзывов: {new_revs}\n"
+            f"• Ошибок: {errors}"
+        )
+    except ReviewsSyncAlreadyRunningError:
+        await status_msg.edit_text("⚠️ Проверка отзывов уже выполняется.")
+    except Exception as exc:
+        await status_msg.edit_text(f"❌ Ошибка проверки: {escape(str(exc))}")
+
+
+@router.message(Command("reviews_on"))
+async def reviews_on_command(
+    message: Message,
+    runtime_settings_repo: RuntimeSettingsRepository | None = None,
+    reviews_scheduler: Any = None,
+) -> None:
+    if runtime_settings_repo is None:
+        await message.answer("Хранилище настроек недоступно.")
+        return
+    await runtime_settings_repo.set("enable_reviews_monitor", "true")
+    if reviews_scheduler:
+        reviews_scheduler.wake()
+    await message.answer("🟢 Reviews Monitor <b>включен</b>. Опрос запущен без перезапуска Argus.")
+
+
+@router.message(Command("reviews_off"))
+async def reviews_off_command(
+    message: Message,
+    runtime_settings_repo: RuntimeSettingsRepository | None = None,
+    reviews_scheduler: Any = None,
+) -> None:
+    if runtime_settings_repo is None:
+        await message.answer("Хранилище настроек недоступно.")
+        return
+    await runtime_settings_repo.set("enable_reviews_monitor", "false")
+    if reviews_scheduler:
+        reviews_scheduler.wake()
+    await message.answer(
+        "🔴 Reviews Monitor <b>выключен</b>. Опрос остановлен, внешние HTTP-запросы прекращены."
+    )

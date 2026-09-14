@@ -1,6 +1,7 @@
 import contextlib
 import logging
 from html import escape
+from typing import Any
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -15,6 +16,8 @@ from app.bot.keyboards import (
     dashboards_keyboard,
     main_menu_keyboard,
     modules_keyboard,
+    reviews_menu_keyboard,
+    reviews_sources_keyboard,
     settings_keyboard,
     setup_cancel_keyboard,
     status_keyboard,
@@ -27,6 +30,8 @@ from app.bot.messages import answer_dashboard
 from app.bot.screens import (
     main_menu_text,
     modules_text,
+    reviews_menu_text,
+    reviews_sources_text,
     setup_text,
     status_text,
     telegram_auth_cli_text,
@@ -36,6 +41,7 @@ from app.bot.states import TelegramAuthStates, TelegramSourceSetupStates, VKSetu
 from app.collectors.telegram import LargeFloodWait, TelegramCollector, TelegramSourceError
 from app.config import Settings
 from app.modules import ModuleRegistry, ModuleStatus
+from app.reviews.models import ReviewsSyncAlreadyRunningError
 from app.storage.models import Source
 from app.storage.repositories import (
     RuntimeSettingsRepository,
@@ -386,7 +392,11 @@ async def tg_dashboard_source_callback(
         text = await dashboard_service.render(source_id, period)
         chart_png = await dashboard_service.render_chart_png(source_id, period)
     except Exception as exc:
-        await _edit(query, f"Telegram dashboard unavailable: {_safe_error(exc)}", telegram_menu_keyboard(True))
+        await _edit(
+            query,
+            f"Telegram dashboard unavailable: {_safe_error(exc)}",
+            telegram_menu_keyboard(True),
+        )
         return
 
     await query.answer()
@@ -774,3 +784,124 @@ async def _alerts_text(runtime_settings_repo: RuntimeSettingsRepository, setting
 
 def _flag(value: bool) -> str:
     return "on" if value else "off"
+
+
+@router.callback_query(F.data == "reviews:menu")
+async def reviews_menu_callback(
+    query: CallbackQuery,
+    reviews_service: Any = None,
+    reviews_scheduler: Any = None,
+) -> None:
+    if reviews_service is None:
+        await query.answer("Reviews Monitor не инициализирован.", show_alert=True)
+        return
+    config = await reviews_service.effective_config()
+    stats = await reviews_service.repository.get_stats()
+    sched_status = await reviews_scheduler.get_status() if reviews_scheduler else {}
+    text = await reviews_menu_text(stats, sched_status, config)
+    await _edit(query, text, reviews_menu_keyboard(config.enabled))
+
+
+@router.callback_query(F.data == "reviews:sources")
+async def reviews_sources_callback(
+    query: CallbackQuery,
+    reviews_service: Any = None,
+) -> None:
+    if reviews_service is None:
+        await query.answer("Reviews Monitor не инициализирован.", show_alert=True)
+        return
+    sources = await reviews_service.repository.list_sources()
+    text = reviews_sources_text(sources)
+    await _edit(query, text, reviews_sources_keyboard())
+
+
+@router.callback_query(F.data == "reviews:status")
+async def reviews_status_callback(
+    query: CallbackQuery,
+    reviews_service: Any = None,
+    reviews_scheduler: Any = None,
+) -> None:
+    if reviews_service is None:
+        await query.answer("Reviews Monitor не инициализирован.", show_alert=True)
+        return
+    sources = await reviews_service.repository.list_sources()
+    text = reviews_sources_text(sources)
+    await _edit(query, text, reviews_sources_keyboard())
+
+
+@router.callback_query(F.data == "reviews:sync")
+async def reviews_sync_callback(
+    query: CallbackQuery,
+    reviews_service: Any = None,
+) -> None:
+    if reviews_service is None:
+        await query.answer("Reviews Monitor не инициализирован.", show_alert=True)
+        return
+    config = await reviews_service.effective_config()
+    if not config.enabled:
+        await query.answer(
+            "Reviews Monitor выключен. Сначала включите мониторинг.",
+            show_alert=True,
+        )
+        if query.message:
+            await query.message.answer("Reviews Monitor выключен. Сначала включите мониторинг.")
+        return
+    await query.answer("Запуск ручной проверки 12 филиалов...")
+    try:
+        results = await reviews_service.sync_all_sources(force=True)
+        new_revs = sum(len(r.new_reviews) for r in results)
+        errors = sum(1 for r in results if r.is_error)
+        await query.message.answer(
+            f"✅ Проверка завершена.\n"
+            f"• Проверено филиалов: {len(results)}\n"
+            f"• Новых отзывов: {new_revs}\n"
+            f"• Ошибок: {errors}"
+        )
+    except ReviewsSyncAlreadyRunningError:
+        await query.message.answer("⚠️ Проверка отзывов уже выполняется.")
+    except Exception as exc:
+        await query.message.answer(f"❌ Ошибка проверки: {escape(str(exc))}")
+
+
+@router.callback_query(F.data == "reviews:on")
+async def reviews_on_callback(
+    query: CallbackQuery,
+    runtime_settings_repo: RuntimeSettingsRepository | None = None,
+    reviews_service: Any = None,
+    reviews_scheduler: Any = None,
+) -> None:
+    if runtime_settings_repo is None:
+        await query.answer("Настройки недоступны.", show_alert=True)
+        return
+    await runtime_settings_repo.set("enable_reviews_monitor", "true")
+    if reviews_scheduler:
+        reviews_scheduler.wake()
+    await query.answer("🟢 Reviews Monitor включен!")
+    if reviews_service:
+        config = await reviews_service.effective_config()
+        stats = await reviews_service.repository.get_stats()
+        sched_status = await reviews_scheduler.get_status() if reviews_scheduler else {}
+        text = await reviews_menu_text(stats, sched_status, config)
+        await _edit(query, text, reviews_menu_keyboard(True))
+
+
+@router.callback_query(F.data == "reviews:off")
+async def reviews_off_callback(
+    query: CallbackQuery,
+    runtime_settings_repo: RuntimeSettingsRepository | None = None,
+    reviews_service: Any = None,
+    reviews_scheduler: Any = None,
+) -> None:
+    if runtime_settings_repo is None:
+        await query.answer("Настройки недоступны.", show_alert=True)
+        return
+    await runtime_settings_repo.set("enable_reviews_monitor", "false")
+    if reviews_scheduler:
+        reviews_scheduler.wake()
+    await query.answer("🔴 Reviews Monitor выключен!")
+    if reviews_service:
+        config = await reviews_service.effective_config()
+        stats = await reviews_service.repository.get_stats()
+        sched_status = await reviews_scheduler.get_status() if reviews_scheduler else {}
+        text = await reviews_menu_text(stats, sched_status, config)
+        await _edit(query, text, reviews_menu_keyboard(False))

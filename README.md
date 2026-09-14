@@ -222,7 +222,34 @@ Main tables:
 - Telegram: `sources`, `posts`, `comments`, `telegram_group_messages`,
   `telegram_keywords`, `stats_snapshots`
 - VK: `vk_sources`, `vk_posts`, `vk_comments`, `vk_stats_snapshots`
+- Reviews: `review_sources`, `reviews`
 - Runtime: `runtime_settings`, `scheduler_state`, `alerts`
+
+## Reviews Monitor
+
+Reviews Monitor autonomously tracks public reviews across 12 educational branch endpoints (6 on Yandex Maps + 6 on 2GIS).
+
+Key features:
+- **Default State**: Disabled by default (`ENABLE_REVIEWS_MONITOR=false`).
+- **Runtime Enable/Disable**: Toggle on/off dynamically via `/reviews_on` and `/reviews_off` or the Telegram UI without restarting Argus. While disabled, zero external HTTP requests are made.
+- **Network Implementation**:
+  - **2GIS**: Asynchronous HTTP client via `aiohttp` querying the 2GIS Reviews API (`public-api.reviews.2gis.com`). This endpoint is utilized by the public web client and represents an internal web implementation detail that may change over time; automated health monitoring detects breaking format or schema changes.
+  - **Yandex Maps**: Lightweight standard library `urllib.request` dispatched via `asyncio.to_thread` with automated cookie/session initialization. Rather than requiring TLS/JA3 spoofing, visiting the public org page initializes valid `csrfToken` and `sessionId` cookies required by Yandex's internal `fetchReviews` endpoint.
+- **Polite Rate Limiting**: Uniform `reviews_request_pause_seconds = 3.0s` default pause between requests to respect platform quotas and prevent 429/rate-limit blocks.
+- **Zero Headless Browsers**: Operates entirely via verified, lightweight HTTP requests without Chromium or Playwright overhead.
+- **Resource Footprint**: The Reviews Monitor module adds minimal memory overhead (~10–25 MB RSS based on standalone probe benchmarks).
+- **Baseline Initialization**: The initial batch of historical reviews is saved without sending Telegram notifications (`is_initialized = 0`). Only new reviews detected in subsequent cycles trigger alerts.
+- **Chronological Delivery**: New reviews are delivered in chronological order (oldest to newest).
+- **Safe HTML & Multi-Target Multipart Delivery**: Long reviews (>4000 chars) are safely chunked before HTML escaping to prevent tag or entity slicing. Part-level delivery is tracked independently per alert chat target (`raw_payload_json`), preventing redundant re-delivery upon partial network failures.
+- **Non-Waiting Sync Lock**: Manual or concurrent background sync requests immediately reject parallel runs with a clear warning rather than stacking duplicate HTTP traffic.
+- **Health & Recovery Alerts**: Suppresses transient errors; sends a problem alert after 3 consecutive failures, and sends a single recovery alert upon successful reconnect.
+
+Commands:
+- `/reviews` — Open Reviews Monitor management screen.
+- `/reviews_status` — View detailed status of all 12 monitored branches.
+- `/reviews_sync` — Trigger immediate manual verification of all branches.
+- `/reviews_on` — Activate reviews polling at runtime without restart.
+- `/reviews_off` — Pause reviews polling at runtime without restart.
 
 Runtime settings from the bot can supplement `.env`. `.env` remains the priority
 configuration source.

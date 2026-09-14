@@ -1,2 +1,1 @@
 """SQLite storage layer."""
-

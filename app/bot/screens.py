@@ -1,7 +1,7 @@
 from html import escape
+from typing import Any
 
 from app.modules import ModuleInfo, ModuleRegistry, ModuleStatus
-
 
 STATUS_ICON = {
     ModuleStatus.OK: "✅",
@@ -127,3 +127,61 @@ def telegram_auth_cli_text(configured: bool) -> str:
 def _module_line(module: ModuleInfo) -> str:
     icon = STATUS_ICON[module.status]
     return f"{icon} {escape(module.name)} — {escape(module.status.value)}"
+
+
+async def reviews_menu_text(stats: dict, sched_status: dict, config: Any) -> str:
+    enabled = config.enabled
+    enabled_icon = "🟢 Включен" if enabled else "🔴 Выключен"
+    health = sched_status.get("health_status", "UNKNOWN")
+    health_icon = "✅" if health == "HEALTHY" else ("⏸️" if health == "IDLE_DISABLED" else "⚠️")
+
+    last_cycle = sched_status.get("last_completed_cycle_at") or "еще не выполнялся"
+    poll_min = max(1, config.poll_interval_seconds // 60)
+
+    return "\n".join(
+        [
+            "⭐ <b>Reviews Monitor</b>",
+            "",
+            f"Статус: <b>{enabled_icon}</b>",
+            f"Здоровье шедулера: {health_icon} <b>{escape(health)}</b>",
+            f"Интервал опроса: <b>{poll_min} мин.</b>",
+            f"Последний полный цикл: <code>{escape(last_cycle)}</code>",
+            "",
+            "<b>Статистика:</b>",
+            f"• Всего филиалов: <b>{stats.get('total_sources', 12)}</b> "
+            f"(активных: {stats.get('active_sources', 0)})",
+            f"• Проблемных филиалов: <b>{stats.get('degraded_sources', 0)}</b>",
+            f"• Всего отзывов в базе: <b>{stats.get('total_reviews', 0)}</b>",
+            f"• Ожидает отправки в TG: <b>{stats.get('unsent_reviews', 0)}</b>",
+            "",
+            "Выбери действие:",
+        ]
+    )
+
+
+def reviews_sources_text(sources: list) -> str:
+    lines = [
+        "📋 <b>Филиалы Reviews Monitor (12 источников):</b>",
+        "",
+    ]
+    for s in sources:
+        platform_name = "Яндекс" if getattr(s, "platform", "") == "yandex" else "2ГИС"
+        status_icon = (
+            "🟢"
+            if getattr(s, "last_status", "")
+            in ("SUCCESS", "SUCCESS_NO_NEW_REVIEWS", "SUCCESS_NEW_REVIEWS")
+            else ("🟡" if getattr(s, "last_status", "") == "PENDING" else "🔴")
+        )
+        branch = getattr(s, "branch_name", "Филиал")
+        last_chk = getattr(s, "last_checked_at", None) or "не проверялся"
+        rating_str = (
+            f" ⭐ {s.last_rating:.1f}" if getattr(s, "last_rating", None) is not None else ""
+        )
+
+        lines.append(f"{status_icon} <b>{escape(branch)}</b> ({platform_name}){rating_str}")
+        lines.append(f"   Проверка: <code>{escape(last_chk)}</code>")
+        if getattr(s, "last_error", None):
+            lines.append(f"   Ошибка: <i>{escape(s.last_error[:80])}</i>")
+        lines.append("")
+
+    return "\n".join(lines)
