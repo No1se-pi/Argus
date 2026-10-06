@@ -1,13 +1,17 @@
 from html import escape
+import tempfile
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from aiogram import Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
+from aiogram.types import FSInputFile, Message
 
 from app.analytics.dashboard import DashboardService
 from app.analytics.periods import parse_period
+from app.analytics.telegram_monitoring import generate_monitoring_charts
 from app.bot.keyboards import (
     main_menu_keyboard,
     reviews_menu_keyboard,
@@ -30,6 +34,7 @@ from app.bot.states import TelegramSourceSetupStates
 from app.collectors.telegram import LargeFloodWait, TelegramCollector, TelegramSourceError
 from app.modules import ModuleRegistry, ModuleStatus
 from app.reviews.models import ReviewsSyncAlreadyRunningError
+from app.services.daily_digest import DailyDigestService
 from app.storage.models import Post, Source, TelegramGroupMessage
 from app.storage.repositories import (
     PostRepository,
@@ -37,6 +42,7 @@ from app.storage.repositories import (
     SourceRepository,
     TelegramGroupMessageRepository,
     TelegramKeywordRepository,
+    TelegramMonitoringRepository,
 )
 from app.telegram_auth import TelegramAuthService
 from app.vk.service import VKService
@@ -80,6 +86,11 @@ Telegram Monitor:
 /tg_dashboard &lt;source_id_or_telegram_id&gt; &lt;period&gt;
 /tg_sync_posts &lt;source_id&gt;
 /tg_set_mode &lt;source_id&gt; &lt;posts|discussion&gt;
+/tg_monitor
+/tg_alerts
+/tg_digest
+/tg_charts
+/tg_llm_status
 
 Legacy Telegram commands still work when Telegram Monitor is available:
 /sources
@@ -112,6 +123,68 @@ async def request_access_command(message: Message) -> None:
 @router.message(Command("status"))
 async def status_command(message: Message, module_registry: ModuleRegistry) -> None:
     await message.answer(await status_text(module_registry))
+
+
+@router.message(Command("tg_monitor"))
+async def tg_monitor_command(
+    message: Message,
+    module_registry: ModuleRegistry,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    info = await module_registry.telegram_info()
+    queued = await telegram_monitoring_repo.pending_count()
+    await message.answer(
+        "🔭 <b>Telegram Monitoring</b>\n\n"
+        f"Collector: <b>{escape(info.status.value)}</b>\n"
+        f"Очередь анализа: <b>{queued}</b>\n\n"
+        "Команды: /tg_sources, /tg_alerts, /tg_digest, /tg_charts, /tg_llm_status"
+    )
+
+
+@router.message(Command("tg_llm_status"))
+async def tg_llm_status_command(
+    message: Message,
+    settings,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    queued = await telegram_monitoring_repo.pending_count()
+    configured = bool(settings.ollama_enabled and settings.ollama_model)
+    await message.answer(
+        "🧠 <b>Ollama</b>\n"
+        f"Статус конфигурации: {'✅ готово' if configured else '⚠️ не настроено'}\n"
+        f"Модель: <code>{escape(settings.ollama_model or 'не задана')}</code>\n"
+        f"Очередь: <b>{queued}</b>"
+    )
+
+
+@router.message(Command("tg_alerts"))
+async def tg_alerts_command(message: Message) -> None:
+    await message.answer(
+        "🚨 Риск-алерты отправляются автоматически при достижении настроенного порога. "
+        "Фильтр и журнал доступны в таблице telegram_risk_alerts."
+    )
+
+
+@router.message(Command("tg_digest"))
+async def tg_digest_command(message: Message, digest_service: DailyDigestService) -> None:
+    today = datetime.now().astimezone().date().isoformat()
+    await message.answer(await digest_service.build(today))
+
+
+@router.message(Command("tg_charts"))
+async def tg_charts_command(
+    message: Message,
+    source_repo: SourceRepository,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    today = datetime.now().astimezone().date().isoformat()
+    for source in await source_repo.list_sources():
+        await telegram_monitoring_repo.aggregate_day(today, source.id)
+    rows = await telegram_monitoring_repo.chart_rows(30)
+    with tempfile.TemporaryDirectory(prefix="argus-charts-") as directory:
+        paths = generate_monitoring_charts(rows, Path(directory))
+        for path in paths:
+            await message.answer_photo(FSInputFile(path))
 
 
 @router.message(Command("modules"))

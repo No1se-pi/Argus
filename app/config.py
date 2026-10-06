@@ -84,6 +84,20 @@ class Settings(BaseSettings):
     tg_comment_alerts_per_cycle: int = 10
     tg_reactions_sync_interval_seconds: int = 1800
     flood_wait_small_seconds: int = 60
+    telegram_catchup_limit: int = 200
+    telegram_analysis_queue_limit: int = 1000
+    ollama_enabled: bool = True
+    ollama_url: str = "http://127.0.0.1:11434"
+    ollama_model: str = ""
+    ollama_timeout: float = 30.0
+    llm_risk_analysis_enabled: bool = True
+    llm_analyze_all_messages: bool = True
+    llm_batch_size: int = 10
+    llm_max_concurrent_requests: int = 2
+    llm_alert_min_severity: int = 2
+    daily_digest_enabled: bool = True
+    daily_digest_time: str = "09:00"
+    timezone: str = "Europe/Moscow"
     log_level: str = "INFO"
 
     @field_validator("alert_chat_id", "tg_api_id", "vk_group_id", mode="before")

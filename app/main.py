@@ -18,6 +18,10 @@ from app.reviews.scheduler import ReviewsPollingScheduler
 from app.reviews.service import ReviewsService
 from app.scheduler.jobs import BackgroundScheduler
 from app.scheduler.rate_limit import TelegramRateLimiter
+from app.services.llm.classifier import MessageClassifier
+from app.services.llm.ollama_client import OllamaClient
+from app.services.daily_digest import DailyDigestScheduler, DailyDigestService
+from app.services.telegram_monitoring import AnalysisWorker, TelegramRealtimeMonitor
 from app.storage.database import Database
 from app.storage.repositories import RepositoryBundle
 from app.storage.schema import init_schema
@@ -46,6 +50,14 @@ async def main() -> None:
         settings=settings,
         alerts=repositories.alerts,
         runtime_settings=repositories.runtime_settings,
+    )
+    ollama = (
+        OllamaClient(settings.ollama_url, settings.ollama_model, settings.ollama_timeout)
+        if settings.ollama_enabled
+        else None
+    )
+    digest_service = DailyDigestService(
+        settings=settings, repositories=repositories, bot=bot, llm_client=ollama
     )
 
     telegram_client, collector = await _start_telegram_monitor(settings, repositories)
@@ -91,11 +103,19 @@ async def main() -> None:
         access_service=access_service,
         reviews_service=reviews_service,
         reviews_scheduler=reviews_scheduler,
+        telegram_monitoring_repo=repositories.telegram_monitoring,
+        digest_service=digest_service,
     )
 
     schedulers = []
     tasks: list[asyncio.Task] = []
+    realtime_monitor = None
+    analysis_worker = None
     if collector is not None:
+        realtime_monitor = TelegramRealtimeMonitor(
+            client=telegram_client, settings=settings, repositories=repositories
+        )
+        await realtime_monitor.start()
         telegram_scheduler = BackgroundScheduler(
             settings=settings,
             sources=repositories.sources,
@@ -107,6 +127,23 @@ async def main() -> None:
         )
         schedulers.append(telegram_scheduler)
         tasks.append(asyncio.create_task(telegram_scheduler.run(), name="argus-telegram-scheduler"))
+
+        if ollama is not None and settings.llm_risk_analysis_enabled:
+            analysis_worker = AnalysisWorker(
+                settings=settings,
+                repositories=repositories,
+                classifier=MessageClassifier(ollama),
+                bot=bot,
+            )
+            tasks.append(asyncio.create_task(analysis_worker.run(), name="argus-llm-analysis"))
+
+        digest_scheduler = DailyDigestScheduler(
+            settings=settings,
+            service=digest_service,
+            scheduler_state=repositories.scheduler_state,
+        )
+        schedulers.append(digest_scheduler)
+        tasks.append(asyncio.create_task(digest_scheduler.run(), name="argus-daily-digest"))
 
     vk_scheduler = VKPollingScheduler(settings=settings, service=vk_service, alerts=alert_service)
     schedulers.append(vk_scheduler)
@@ -126,6 +163,11 @@ async def main() -> None:
         logger.info("Argus shutdown started")
         for scheduler in schedulers:
             scheduler.stop()
+        if analysis_worker is not None:
+            analysis_worker.stop()
+        if realtime_monitor is not None:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await realtime_monitor.stop()
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

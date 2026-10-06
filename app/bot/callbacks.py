@@ -1,21 +1,28 @@
 import contextlib
+import json
 import logging
+import tempfile
+from datetime import datetime
 from html import escape
+from pathlib import Path
 from typing import Any
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.analytics.dashboard import DashboardService
+from app.analytics.telegram_monitoring import generate_monitoring_charts
 from app.bot.access import AccessRequestService
 from app.bot.keyboards import (
     alerts_keyboard,
+    alert_feedback_keyboard,
     confirm_keyboard,
     dashboards_keyboard,
     main_menu_keyboard,
     modules_keyboard,
+    monitoring_alerts_keyboard,
     reviews_menu_keyboard,
     reviews_sources_keyboard,
     settings_keyboard,
@@ -42,11 +49,13 @@ from app.collectors.telegram import LargeFloodWait, TelegramCollector, TelegramS
 from app.config import Settings
 from app.modules import ModuleRegistry, ModuleStatus
 from app.reviews.models import ReviewsSyncAlreadyRunningError
+from app.services.daily_digest import DailyDigestService
 from app.storage.models import Source
 from app.storage.repositories import (
     RuntimeSettingsRepository,
     SourceRepository,
     TelegramKeywordRepository,
+    TelegramMonitoringRepository,
 )
 from app.telegram_auth import TelegramAuthService
 from app.vk.service import VKService
@@ -217,6 +226,136 @@ async def tg_status_callback(query: CallbackQuery, module_registry: ModuleRegist
     info = await module_registry.telegram_info()
     text = unavailable_text(info) if not info.is_available else "Telegram Monitor: ok"
     await _edit(query, text, telegram_menu_keyboard(info.is_available))
+
+
+@router.callback_query(F.data == "tgm:llm")
+async def monitoring_llm_callback(
+    query: CallbackQuery,
+    settings: Settings,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    queued = await telegram_monitoring_repo.pending_count()
+    ready = settings.ollama_enabled and bool(settings.ollama_model)
+    await _edit(
+        query,
+        "🧠 <b>Ollama</b>\n\n"
+        f"Статус: {'✅ настроена' if ready else '⚠️ не настроена'}\n"
+        f"Модель: <code>{escape(settings.ollama_model or 'не задана')}</code>\n"
+        f"Очередь анализа: <b>{queued}</b>",
+        telegram_menu_keyboard(True),
+    )
+
+
+@router.callback_query(F.data == "tgm:digest")
+async def monitoring_digest_callback(
+    query: CallbackQuery,
+    digest_service: DailyDigestService,
+) -> None:
+    today = datetime.now().astimezone().date().isoformat()
+    await _edit(query, await digest_service.build(today), telegram_menu_keyboard(True))
+
+
+@router.callback_query(F.data.startswith("tgm:alerts:"))
+async def monitoring_alerts_callback(
+    query: CallbackQuery,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    parts = (query.data or "").split(":")
+    try:
+        days = int(parts[2])
+        severity = None if parts[3] == "all" else int(parts[3])
+    except (IndexError, ValueError):
+        await query.answer("Некорректный фильтр", show_alert=True)
+        return
+    alerts = await telegram_monitoring_repo.list_risk_alerts(
+        days=days, severity=severity, limit=10
+    )
+    lines = [f"🚨 <b>Требуют внимания — {days} дн.</b>"]
+    rows = []
+    for alert in alerts:
+        status = "✅" if alert["status"] == "reviewed" else "🆕"
+        lines.append(
+            f"\n{status} <b>#{alert['alert_id']} · severity {alert['severity']}</b>\n"
+            f"{escape(alert['source_title'])}: {escape((alert['text'] or '')[:180])}"
+        )
+        rows.append([
+            InlineKeyboardButton(
+                text=f"Открыть #{alert['alert_id']}",
+                callback_data=f"tgm:alert:{alert['alert_id']}",
+            )
+        ])
+    if not alerts:
+        lines.append("\nЗа выбранный период алертов нет.")
+    base = monitoring_alerts_keyboard(days, severity).inline_keyboard
+    await _edit(query, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows + base))
+
+
+@router.callback_query(F.data.startswith("tgm:alert:"))
+async def monitoring_alert_detail_callback(
+    query: CallbackQuery,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    try:
+        alert_id = int((query.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        await query.answer("Некорректный алерт", show_alert=True)
+        return
+    matches = [
+        item for item in await telegram_monitoring_repo.list_risk_alerts(days=3650, limit=100)
+        if item["alert_id"] == alert_id
+    ]
+    if not matches:
+        await query.answer("Алерт не найден", show_alert=True)
+        return
+    item = matches[0]
+    categories = ", ".join(json.loads(item["categories_json"]))
+    link = f'\n<a href="{escape(item["message_url"])}">🔗 Открыть сообщение</a>' if item["message_url"] else ""
+    await _edit(
+        query,
+        f"🚨 <b>Алерт #{item['alert_id']}</b>\n\n"
+        f"Источник: {escape(item['source_title'])}\n"
+        f"Уровень: <b>{item['severity']} / 3</b>\n"
+        f"Категории: {escape(categories)}\n"
+        f"Confidence: {item['confidence']:.0%}\n\n"
+        f"«{escape((item['text'] or '')[:1500])}»\n\n"
+        f"Почему: {escape(item['reason'])}{link}",
+        alert_feedback_keyboard(alert_id),
+    )
+
+
+@router.callback_query(F.data.startswith("tgm:feedback:"))
+async def monitoring_feedback_callback(
+    query: CallbackQuery,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    parts = (query.data or "").split(":")
+    try:
+        alert_id = int(parts[2])
+        verdict = parts[3]
+        admin_id = query.from_user.id
+        updated = await telegram_monitoring_repo.set_alert_feedback(alert_id, verdict, admin_id)
+    except (IndexError, ValueError):
+        await query.answer("Некорректная оценка", show_alert=True)
+        return
+    await query.answer("Оценка сохранена" if updated else "Алерт не найден", show_alert=True)
+
+
+@router.callback_query(F.data == "tgm:charts")
+async def monitoring_charts_callback(
+    query: CallbackQuery,
+    source_repo: SourceRepository,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    today = datetime.now().astimezone().date().isoformat()
+    for source in await source_repo.list_sources():
+        await telegram_monitoring_repo.aggregate_day(today, source.id)
+    rows = await telegram_monitoring_repo.chart_rows(30)
+    await query.answer()
+    if query.message is None:
+        return
+    with tempfile.TemporaryDirectory(prefix="argus-charts-") as directory:
+        for path in generate_monitoring_charts(rows, Path(directory)):
+            await query.message.answer_photo(FSInputFile(path))
 
 
 @router.callback_query(F.data == "tg:sources")

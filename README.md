@@ -140,6 +140,73 @@ Telegram commands:
 - `/tg_posts <source_id_or_telegram_id> <period> [limit]`
 - `/tg_sync_posts <source_id>`
 - `/tg_dashboard <source_id_or_telegram_id> <period>`
+- `/tg_monitor` — состояние realtime-сборщика и очереди анализа
+- `/tg_alerts` — справка по риск-алертам
+- `/tg_digest` — дневная сводка
+- `/tg_charts` — четыре PNG-графика за 30 дней
+- `/tg_llm_status` — модель и размер очереди Ollama
+
+### Telegram Monitoring and Ollama analysis
+
+The extended monitoring pipeline reuses the authorized Telethon user session. It does not
+perform a second authorization and does not bypass access restrictions:
+
+```text
+Telegram -> Telethon NewMessage/catch-up -> SQLite -> persistent analysis queue
+         -> Ollama -> strict classifier JSON -> alerts + daily analytics -> Argus Bot UI
+```
+
+Messages are unique by source and Telegram message id. On startup, Argus fetches only
+messages after the saved cursor, up to `TELEGRAM_CATCHUP_LIMIT`, and then attaches the
+realtime handler. Service messages are ignored. Entity ids/access hashes saved on the
+source are reused instead of resolving a username for every event.
+
+The prefilter only changes queue priority; it never makes the final safety decision.
+Ollama evaluates intent and context and returns risk, severity, confidence, categories,
+sentiment, topic, reason, and intent level. Alerts are deduplicated in SQLite, include the
+model explanation, and link to the original message where Telegram permits it. Argus is
+an aid for human review and does not make disciplinary decisions.
+
+If Ollama is unavailable, collection continues and messages remain queued for retry.
+Configure the integration with:
+
+```env
+TELEGRAM_CATCHUP_LIMIT=200
+TELEGRAM_ANALYSIS_QUEUE_LIMIT=1000
+OLLAMA_ENABLED=true
+OLLAMA_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen2.5:3b
+OLLAMA_TIMEOUT=30
+LLM_RISK_ANALYSIS_ENABLED=true
+LLM_ANALYZE_ALL_MESSAGES=true
+LLM_BATCH_SIZE=10
+LLM_MAX_CONCURRENT_REQUESTS=2
+LLM_ALERT_MIN_SEVERITY=2
+DAILY_DIGEST_ENABLED=true
+DAILY_DIGEST_TIME=09:00
+TIMEZONE=Europe/Moscow
+```
+
+Only messages from explicitly configured sources accessible to the Telethon account are
+stored. Argus does not build personal profiles or infer identity, beliefs, religion,
+orientation, or other sensitive traits. Do not log or commit session files and secrets.
+
+### Updating the existing Vavilon installation
+
+The update keeps `.env`, `data/`, and `sessions/` in place and requires no Docker or
+network-namespace changes:
+
+```bash
+cd /srv/services/argus
+sudo -u no1se git pull --ff-only
+sudo -u no1se /srv/services/argus/.venv/bin/pip install -r requirements.txt
+sudo systemctl restart argus.service
+sudo systemctl status argus.service --no-pager
+sudo journalctl -u argus.service -n 100 --no-pager
+```
+
+SQLite tables are created idempotently during normal startup. Back up
+`data/argus.sqlite3` before deployment according to the server's existing backup policy.
 
 Legacy commands such as `/sources`, `/add_source`, `/sync_posts`, and `/dashboard`
 still work when Telegram Monitor is available.
