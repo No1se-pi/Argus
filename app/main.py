@@ -83,6 +83,8 @@ async def main() -> None:
         telegram_collector=collector,
         reviews_service=reviews_service,
         reviews_scheduler=reviews_scheduler,
+        telegram_monitoring_repo=repositories.telegram_monitoring,
+        ollama_client=ollama,
     )
     telegram_auth_service = TelegramAuthService(settings)
     access_service = AccessRequestService(settings)

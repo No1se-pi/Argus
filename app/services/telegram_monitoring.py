@@ -5,6 +5,7 @@ from datetime import timezone
 from html import escape
 
 from telethon import events, types
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.services.llm.ollama_client import OllamaUnavailable
 from app.services.llm.prompts import PROMPT_VERSION
@@ -144,8 +145,9 @@ class AnalysisWorker:
                     row["id"], result, self.classifier.client.model, PROMPT_VERSION
                 )
                 if inserted and result.risk and result.severity >= self.settings.llm_alert_min_severity:
-                    if await self.repositories.telegram_monitoring.create_risk_alert(row["id"]):
-                        await self._send_alert(row, result)
+                    alert_id = await self.repositories.telegram_monitoring.create_risk_alert(row["id"])
+                    if alert_id:
+                        await self._send_alert(row, result, alert_id)
             except OllamaUnavailable as exc:
                 await self.repositories.telegram_monitoring.mark_error(row["id"], str(exc))
                 logger.warning("Ollama unavailable; analysis retained in queue: %s", exc)
@@ -154,7 +156,7 @@ class AnalysisWorker:
                 await self.repositories.telegram_monitoring.mark_error(row["id"], str(exc))
                 logger.warning("Telegram message analysis failed message_id=%s: %s", row["id"], exc)
 
-    async def _send_alert(self, row: dict, result) -> None:
+    async def _send_alert(self, row: dict, result, alert_id: int) -> None:
         categories = ", ".join(result.categories) or "other"
         icons = {1: "🟡", 2: "🟠", 3: "🔴"}
         text = (
@@ -171,6 +173,24 @@ class AnalysisWorker:
         targets = [self.settings.alert_chat_id] if self.settings.alert_chat_id else list(self.settings.admin_ids)
         for chat_id in targets:
             try:
-                await self.bot.send_message(chat_id, text, disable_web_page_preview=True)
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="✅ Подтвердить",
+                            callback_data=f"tgm:feedback:{alert_id}:confirmed",
+                        ),
+                        InlineKeyboardButton(
+                            text="❌ Ложное",
+                            callback_data=f"tgm:feedback:{alert_id}:false_positive",
+                        ),
+                    ],
+                    [InlineKeyboardButton(
+                        text="👁 Просмотрено",
+                        callback_data=f"tgm:feedback:{alert_id}:reviewed",
+                    )],
+                ])
+                await self.bot.send_message(
+                    chat_id, text, disable_web_page_preview=True, reply_markup=keyboard
+                )
             except Exception as exc:
                 logger.warning("Failed to send risk alert chat_id=%s: %s", chat_id, exc)

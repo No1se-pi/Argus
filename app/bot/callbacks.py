@@ -368,7 +368,7 @@ async def tg_sources_callback(
     if not info.is_available:
         await _edit(query, unavailable_text(info), telegram_menu_keyboard(False))
         return
-    sources = await source_repo.list_sources()
+    sources = await source_repo.list_sources(include_inactive=True)
     if not sources:
         await _edit(
             query,
@@ -377,13 +377,57 @@ async def tg_sources_callback(
         )
         return
     lines = ["<b>Telegram sources</b>"]
+    rows = []
     for source in sources:
         telegram_id = source.telegram_reference_id or "unknown"
+        state = "🟢" if source.is_active else "⚪"
         lines.append(
-            f"#{source.id} {escape(source.display_name)}\n"
+            f"{state} #{source.id} {escape(source.display_name)}\n"
             f"  telegram_id: {telegram_id}, mode: {escape(source.telegram_monitor_mode)}"
         )
-    await _edit(query, "\n".join(lines), telegram_menu_keyboard(True))
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=("🔕 Выключить" if source.is_active else "🔔 Включить") + f" #{source.id}",
+                    callback_data=f"tgm:source:toggle:{source.id}",
+                ),
+                InlineKeyboardButton(
+                    text=f"🗑 Убрать #{source.id}",
+                    callback_data=f"tgm:source:remove:{source.id}",
+                ),
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ Telegram", callback_data="tg:menu")])
+    await _edit(query, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("tgm:source:"))
+async def monitoring_source_action_callback(
+    query: CallbackQuery,
+    source_repo: SourceRepository,
+    module_registry: ModuleRegistry,
+) -> None:
+    parts = (query.data or "").split(":")
+    try:
+        action, source_id = parts[2], int(parts[3])
+    except (IndexError, ValueError):
+        await query.answer("Некорректный источник", show_alert=True)
+        return
+    source = await source_repo.get_source(source_id)
+    if source is None:
+        await query.answer("Источник не найден", show_alert=True)
+        return
+    if action == "toggle":
+        active = not source.is_active
+        await source_repo.set_active(source_id, active)
+        await query.answer("Мониторинг включён" if active else "Мониторинг выключен")
+    elif action == "remove":
+        await source_repo.set_active(source_id, False)
+        await query.answer("Источник убран из мониторинга; история сохранена")
+    else:
+        await query.answer("Неизвестное действие", show_alert=True)
+        return
+    await tg_sources_callback(query, module_registry, source_repo)
 
 
 @router.callback_query(F.data == "tg:add_source")

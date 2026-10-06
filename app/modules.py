@@ -49,6 +49,8 @@ class ModuleRegistry:
         telegram_collector=None,
         reviews_service=None,
         reviews_scheduler=None,
+        telegram_monitoring_repo=None,
+        ollama_client=None,
     ) -> None:
         self.settings = settings
         self.runtime_settings = runtime_settings
@@ -56,6 +58,8 @@ class ModuleRegistry:
         self.telegram_collector = telegram_collector
         self.reviews_service = reviews_service
         self.reviews_scheduler = reviews_scheduler
+        self.telegram_monitoring_repo = telegram_monitoring_repo
+        self.ollama_client = ollama_client
 
     async def module_infos(self, *, check_network: bool = False) -> list[ModuleInfo]:
         return [
@@ -171,10 +175,24 @@ class ModuleRegistry:
                 available_commands=[],
             )
 
+        details = []
+        if self.telegram_monitoring_repo is not None:
+            stats = await self.telegram_monitoring_repo.health_stats()
+            details.extend(
+                [
+                    f"sources: {stats['online']}/{stats['sources']}",
+                    f"messages today: {stats['messages_today']}",
+                    f"alerts today: {stats['alerts_today']}",
+                    f"analysis queue: {stats['queue']}",
+                ]
+            )
+        if self.ollama_client is not None:
+            details.append(f"Ollama model: {self.ollama_client.model or 'not configured'}")
         return ModuleInfo(
             name="Telegram Monitor",
             enabled=True,
             status=ModuleStatus.OK,
+            reason="Telethon connected" + ("; " + "; ".join(details) if details else ""),
             available_commands=commands,
         )
 

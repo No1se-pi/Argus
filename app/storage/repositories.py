@@ -839,6 +839,21 @@ class TelegramMonitoringRepository:
             row = await cursor.fetchone()
         return int(row["count"])
 
+    async def health_stats(self) -> dict[str, int]:
+        connection = self.database.require_connection()
+        query = """SELECT
+            (SELECT COUNT(*) FROM sources WHERE kind='telegram') AS sources,
+            (SELECT COUNT(*) FROM sources WHERE kind='telegram' AND is_active=1) AS online,
+            (SELECT COUNT(*) FROM telegram_messages
+             WHERE substr(message_date,1,10)=date('now')) AS messages_today,
+            (SELECT COUNT(*) FROM telegram_risk_alerts
+             WHERE substr(created_at,1,10)=date('now')) AS alerts_today,
+            (SELECT COUNT(*) FROM telegram_messages
+             WHERE analysis_status IN ('pending','error')) AS queue"""
+        async with connection.execute(query) as cursor:
+            row = await cursor.fetchone()
+        return {key: int(row[key] or 0) for key in row.keys()}
+
     async def save_analysis(self, message_id: int, result, model: str, prompt_version: str) -> bool:
         connection = self.database.require_connection()
         now = utc_now_iso()
@@ -858,6 +873,15 @@ class TelegramMonitoringRepository:
         await connection.commit()
         return cursor.rowcount == 1
 
+    async def set_active(self, source_id: int, active: bool) -> bool:
+        connection = self.database.require_connection()
+        cursor = await connection.execute(
+            "UPDATE sources SET is_active = ?, updated_at = ? WHERE id = ?",
+            (int(active), utc_now_iso(), source_id),
+        )
+        await connection.commit()
+        return cursor.rowcount == 1
+
     async def mark_error(self, message_id: int, error: str) -> None:
         connection = self.database.require_connection()
         await connection.execute(
@@ -867,14 +891,16 @@ class TelegramMonitoringRepository:
         )
         await connection.commit()
 
-    async def create_risk_alert(self, message_id: int) -> bool:
+    async def create_risk_alert(self, message_id: int) -> int | None:
         connection = self.database.require_connection()
         cursor = await connection.execute(
             "INSERT OR IGNORE INTO telegram_risk_alerts(message_id, created_at) VALUES (?, ?)",
             (message_id, utc_now_iso()),
         )
         await connection.commit()
-        return cursor.rowcount == 1
+        if cursor.rowcount != 1:
+            return None
+        return int(cursor.lastrowid)
 
     async def aggregate_day(self, date: str, source_id: int) -> dict:
         connection = self.database.require_connection()
