@@ -58,6 +58,7 @@ from app.storage.repositories import (
     TelegramMonitoringRepository,
 )
 from app.telegram_auth import TelegramAuthService
+from app.time import local_date_iso
 from app.vk.service import VKService
 
 logger = logging.getLogger(__name__)
@@ -250,8 +251,9 @@ async def monitoring_llm_callback(
 async def monitoring_digest_callback(
     query: CallbackQuery,
     digest_service: DailyDigestService,
+    settings: Settings,
 ) -> None:
-    today = datetime.now().astimezone().date().isoformat()
+    today = local_date_iso(settings.timezone)
     await _edit(query, await digest_service.build(today), telegram_menu_keyboard(True))
 
 
@@ -345,8 +347,9 @@ async def monitoring_charts_callback(
     query: CallbackQuery,
     source_repo: SourceRepository,
     telegram_monitoring_repo: TelegramMonitoringRepository,
+    settings: Settings,
 ) -> None:
-    today = datetime.now().astimezone().date().isoformat()
+    today = local_date_iso(settings.timezone)
     for source in await source_repo.list_sources():
         await telegram_monitoring_repo.aggregate_day(today, source.id)
     rows = await telegram_monitoring_repo.chart_rows(30)
@@ -444,7 +447,7 @@ async def tg_add_source_callback(
     await state.set_state(TelegramSourceSetupStates.waiting_forward)
     await _edit(
         query,
-        "Перешли сюда сообщение из канала или discussion-группы. "
+        "Перешли сообщение из канала/группы или отправь ссылку t.me. "
         "После этого выберем режим мониторинга.",
         setup_cancel_keyboard(),
     )

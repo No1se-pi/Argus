@@ -45,6 +45,7 @@ from app.storage.repositories import (
     TelegramMonitoringRepository,
 )
 from app.telegram_auth import TelegramAuthService
+from app.time import local_date_iso
 from app.vk.service import VKService
 
 router = Router(name="admin")
@@ -166,8 +167,8 @@ async def tg_alerts_command(message: Message) -> None:
 
 
 @router.message(Command("tg_digest"))
-async def tg_digest_command(message: Message, digest_service: DailyDigestService) -> None:
-    today = datetime.now().astimezone().date().isoformat()
+async def tg_digest_command(message: Message, digest_service: DailyDigestService, settings) -> None:
+    today = local_date_iso(settings.timezone)
     await message.answer(await digest_service.build(today))
 
 
@@ -176,8 +177,9 @@ async def tg_charts_command(
     message: Message,
     source_repo: SourceRepository,
     telegram_monitoring_repo: TelegramMonitoringRepository,
+    settings,
 ) -> None:
-    today = datetime.now().astimezone().date().isoformat()
+    today = local_date_iso(settings.timezone)
     for source in await source_repo.list_sources():
         await telegram_monitoring_repo.aggregate_day(today, source.id)
     rows = await telegram_monitoring_repo.chart_rows(30)
@@ -345,7 +347,7 @@ async def tg_add_source_command(
     await state.clear()
     await state.set_state(TelegramSourceSetupStates.waiting_forward)
     await message.answer(
-        "Перешли сюда сообщение из канала или discussion-группы. "
+        "Перешли сообщение из канала/группы или отправь ссылку t.me. "
         "После этого выберем режим мониторинга.",
         reply_markup=setup_cancel_keyboard(),
     )

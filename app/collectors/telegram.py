@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 from telethon import TelegramClient, errors, types, utils
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest
 from telethon.tl.types import InputPeerChannel, InputPeerChat
 
 from app.config import Settings
@@ -81,6 +82,9 @@ class TelegramCollector:
         self.rate_limiter = rate_limiter
 
     async def resolve_source(self, link_or_username: str) -> ResolvedTelegramSource:
+        invite_hash = self._invite_hash(link_or_username)
+        if invite_hash is not None:
+            return await self._resolve_joined_invite(link_or_username.strip(), invite_hash)
         reference = self._normalize_reference(link_or_username)
         try:
             entity = await self._call_telegram(
@@ -99,6 +103,25 @@ class TelegramCollector:
             return self._resolved_from_chat(link_or_username.strip(), entity)
 
         raise TelegramSourceError("Поддерживаются только Telegram-каналы и группы.")
+
+    async def _resolve_joined_invite(
+        self, link: str, invite_hash: str
+    ) -> ResolvedTelegramSource:
+        result = await self._call_telegram(
+            "resolve private invite",
+            lambda: self.client(CheckChatInviteRequest(invite_hash)),
+        )
+        entity = getattr(result, "chat", None)
+        if entity is None:
+            raise TelegramSourceError(
+                "Аккаунт Telethon ещё не состоит в приватном источнике. "
+                "Сначала вступите вручную, затем повторите добавление."
+            )
+        if isinstance(entity, types.Channel):
+            return self._resolved_from_channel(link, entity)
+        if isinstance(entity, types.Chat):
+            return self._resolved_from_chat(link, entity)
+        raise TelegramSourceError("Invite-ссылка не ведёт на поддерживаемый канал или группу.")
 
     async def resolve_source_by_chat_id(
         self,
@@ -463,6 +486,17 @@ class TelegramCollector:
             return path
 
         return reference
+
+    def _invite_hash(self, value: str) -> str | None:
+        parsed = urlparse(value.strip())
+        if parsed.netloc not in {"t.me", "telegram.me"}:
+            return None
+        path = parsed.path.strip("/")
+        if path.startswith("+") and len(path) > 1:
+            return path[1:]
+        if path.startswith("joinchat/") and len(path) > len("joinchat/"):
+            return path.split("/", 1)[1]
+        return None
 
     def _extract_reactions(self, message: object) -> tuple[int, dict[str, int]]:
         reactions = getattr(message, "reactions", None)

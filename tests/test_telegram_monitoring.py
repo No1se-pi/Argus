@@ -5,6 +5,8 @@ from app.services.llm.classifier import MessageClassifier
 from app.services.llm.ollama_client import OllamaClient, OllamaUnavailable
 from app.services.telegram_monitoring import prefilter_priority, telegram_message_link
 from app.services.daily_digest import DailyDigestScheduler, DailyDigestService
+from app.time import MOSCOW, local_date_iso, resolve_timezone
+from app.collectors.telegram import TelegramCollector
 from app.storage.database import Database
 from app.storage.repositories import RepositoryBundle
 from app.storage.schema import init_schema
@@ -80,6 +82,24 @@ def test_daily_digest_time_validation():
     assert DailyDigestScheduler._parse_time("09:30") == (9, 30)
     with pytest.raises(ValueError):
         DailyDigestScheduler._parse_time("25:00")
+
+
+def test_moscow_timezone_fallback_and_local_date(monkeypatch):
+    import app.time as time_module
+
+    def missing(_name):
+        raise time_module.ZoneInfoNotFoundError
+
+    monkeypatch.setattr(time_module, "ZoneInfo", missing)
+    assert resolve_timezone("Europe/Moscow") is MOSCOW
+    assert len(local_date_iso("Europe/Moscow")) == 10
+
+
+def test_private_invite_hash_parsing():
+    collector = object.__new__(TelegramCollector)
+    assert collector._invite_hash("https://t.me/+zOCU-V6SGucxOTVi") == "zOCU-V6SGucxOTVi"
+    assert collector._invite_hash("https://t.me/joinchat/abc123") == "abc123"
+    assert collector._invite_hash("https://t.me/public_name") is None
 
 
 @pytest.mark.asyncio

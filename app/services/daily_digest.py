@@ -3,10 +3,10 @@ import logging
 from collections import Counter
 from datetime import datetime, timedelta
 from html import escape
-from zoneinfo import ZoneInfo
 
 from app.services.llm.digest import aggregate_messages, digest_prompt
 from app.services.llm.ollama_client import OllamaUnavailable
+from app.time import local_now
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +114,7 @@ class DailyDigestScheduler:
     async def run_once(self) -> bool:
         if not self.settings.daily_digest_enabled:
             return False
-        now = datetime.now(ZoneInfo(self.settings.timezone))
+        now = local_now(self.settings.timezone)
         hour, minute = self._parse_time(self.settings.daily_digest_time)
         if (now.hour, now.minute) < (hour, minute):
             return False
