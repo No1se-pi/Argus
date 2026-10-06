@@ -5,7 +5,8 @@ from app.services.llm.classifier import MessageClassifier
 from app.services.llm.ollama_client import OllamaClient, OllamaUnavailable
 from app.services.telegram_monitoring import prefilter_priority, telegram_message_link
 from app.services.daily_digest import DailyDigestScheduler, DailyDigestService
-from app.time import MOSCOW, local_date_iso, resolve_timezone
+from app.time import MOSCOW, local_date_iso, period_utc_bounds, resolve_timezone
+from app.bot.keyboards import main_menu_keyboard
 from app.collectors.telegram import TelegramCollector
 from app.storage.database import Database
 from app.storage.repositories import RepositoryBundle
@@ -93,6 +94,13 @@ def test_moscow_timezone_fallback_and_local_date(monkeypatch):
     monkeypatch.setattr(time_module, "ZoneInfo", missing)
     assert resolve_timezone("Europe/Moscow") is MOSCOW
     assert len(local_date_iso("Europe/Moscow")) == 10
+    start, end = period_utc_bounds("Europe/Moscow", 1)
+    assert start < end
+
+
+def test_main_menu_exposes_telegram_analytics():
+    labels = [button.text for row in main_menu_keyboard().inline_keyboard for button in row]
+    assert "🔭 TG Аналитика" in labels
 
 
 def test_private_invite_hash_parsing():
@@ -135,6 +143,13 @@ async def test_daily_aggregation_and_alert_feedback(tmp_path):
     assert stats["messages_count"] == 1
     assert stats["negative_count"] == 1
     assert stats["severity_2_count"] == 1
+    summary = await repositories.telegram_monitoring.monitoring_summary(
+        "2026-10-06T00:00:00+00:00", "2026-10-06T23:59:59+00:00"
+    )
+    assert summary["collected"] == 1
+    assert summary["analyzed"] == 1
+    assert summary["negative"] == 1
+    assert summary["sources"][0]["label"] == "Digest"
 
     settings = SimpleNamespace(alert_chat_id=None, admin_ids={123})
     service = DailyDigestService(
@@ -198,8 +213,15 @@ async def test_deferred_queue_promotion_preserves_messages(tmp_path):
         source_id=source.id, telegram_message_id=1, reply_to_message_id=None,
         text="deferred", message_date="2026-10-06T10:00:00+00:00",
         message_url=None, prefilter_priority=5, analysis_status="deferred",
+        alert_eligible=False,
     )
     assert created is True
+    connection = database.require_connection()
+    async with connection.execute(
+        "SELECT alert_eligible FROM telegram_messages WHERE id=?", (deferred_id,)
+    ) as cursor:
+        stored = await cursor.fetchone()
+    assert stored["alert_eligible"] == 0
     assert await repositories.telegram_monitoring.pending(10) == []
     assert await repositories.telegram_monitoring.promote_deferred(1) == 1
     rows = await repositories.telegram_monitoring.pending(10)

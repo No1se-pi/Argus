@@ -45,7 +45,7 @@ from app.storage.repositories import (
     TelegramMonitoringRepository,
 )
 from app.telegram_auth import TelegramAuthService
-from app.time import local_date_iso
+from app.time import local_date_iso, period_utc_bounds
 from app.vk.service import VKService
 
 router = Router(name="admin")
@@ -92,6 +92,8 @@ Telegram Monitor:
 /tg_digest
 /tg_charts
 /tg_llm_status
+/tg_stats [1|7|30]
+/tg_backfill [limit]
 
 Legacy Telegram commands still work when Telegram Monitor is available:
 /sources
@@ -155,6 +157,62 @@ async def tg_llm_status_command(
         f"Статус конфигурации: {'✅ готово' if configured else '⚠️ не настроено'}\n"
         f"Модель: <code>{escape(settings.ollama_model or 'не задана')}</code>\n"
         f"Очередь: <b>{queued}</b>"
+    )
+
+
+@router.message(Command("tg_stats"))
+async def tg_stats_command(
+    message: Message,
+    command: CommandObject,
+    settings,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    try:
+        days = int(_single_argument(command) or "1")
+    except ValueError:
+        days = 1
+    if days not in {1, 7, 30}:
+        await message.answer("Использование: /tg_stats [1|7|30]")
+        return
+    start_iso, end_iso = period_utc_bounds(settings.timezone, days)
+    stats = await telegram_monitoring_repo.monitoring_summary(start_iso, end_iso)
+    await message.answer(
+        f"🔭 <b>Telegram Analytics — {days} дн.</b>\n\n"
+        f"Собрано: <b>{stats['collected']}</b>\n"
+        f"Проанализировано: <b>{stats['analyzed']}</b>\n"
+        f"Очередь: <b>{stats['pending']}</b> · отложено: {stats['deferred']}\n"
+        f"Ошибки: <b>{stats['errors']}</b>\n\n"
+        f"Настроение: 🟢 {stats['positive']} · ⚪ {stats['neutral']} · 🔴 {stats['negative']}\n"
+        f"Риски: S1 {stats['severity_1']} · S2 {stats['severity_2']} · S3 {stats['severity_3']}"
+    )
+
+
+@router.message(Command("tg_backfill"))
+async def tg_backfill_command(
+    message: Message,
+    command: CommandObject,
+    collector: TelegramCollector | None,
+    source_repo: SourceRepository,
+) -> None:
+    if collector is None:
+        await message.answer("Telethon collector недоступен.")
+        return
+    try:
+        limit = max(1, min(int(_single_argument(command) or "50"), 200))
+    except ValueError:
+        await message.answer("Использование: /tg_backfill [1..200]")
+        return
+    fetched = saved = failed = 0
+    for source in await source_repo.list_sources():
+        try:
+            result = await collector.backfill_analysis(source, limit)
+            fetched += result.fetched_count
+            saved += result.saved_count
+        except Exception:
+            failed += 1
+    await message.answer(
+        f"История: получено {fetched}, добавлено в анализ {saved}, ошибок {failed}. "
+        "Старые алерты отправляться не будут."
     )
 
 

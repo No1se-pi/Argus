@@ -157,7 +157,12 @@ class AnalysisWorker:
                 inserted = await self.repositories.telegram_monitoring.save_analysis(
                     row["id"], result, self.classifier.client.model, PROMPT_VERSION
                 )
-                if inserted and result.risk and result.severity >= self.settings.llm_alert_min_severity:
+                if (
+                    inserted
+                    and row["alert_eligible"]
+                    and result.risk
+                    and result.severity >= self.settings.llm_alert_min_severity
+                ):
                     alert_id = await self.repositories.telegram_monitoring.create_risk_alert(row["id"])
                     if alert_id:
                         await self._send_alert(row, result, alert_id)

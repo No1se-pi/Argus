@@ -67,6 +67,13 @@ class MetricsSyncResult:
     saved_items: int
 
 
+@dataclass(frozen=True)
+class AnalysisBackfillResult:
+    source_id: int
+    fetched_count: int
+    saved_count: int
+
+
 class TelegramCollector:
     def __init__(
         self,
@@ -293,6 +300,52 @@ class TelegramCollector:
             saved += 1
 
         return MetricsSyncResult(source.id, processed_posts=len(posts), saved_items=saved)
+
+    async def backfill_analysis(
+        self, source: Source, limit: int = 50
+    ) -> AnalysisBackfillResult:
+        entity = self._entity_from_source(source)
+        messages = await self._call_telegram(
+            f"analysis backfill for source {source.id}",
+            lambda: self.client.get_messages(entity, limit=max(1, min(limit, 500))),
+        )
+        saved = 0
+        for message in reversed(messages):
+            if isinstance(message, types.MessageService) or not getattr(message, "id", None):
+                continue
+            text = getattr(message, "message", None)
+            reply = getattr(message, "reply_to_msg_id", None)
+            raw_date = self._message_date_iso(message)
+            queue_size = await self.repositories.telegram_monitoring.pending_count()
+            status = (
+                "deferred"
+                if queue_size >= self.settings.telegram_analysis_queue_limit
+                else "pending"
+            )
+            _, created = await self.repositories.telegram_monitoring.save_message(
+                source_id=source.id,
+                telegram_message_id=message.id,
+                reply_to_message_id=reply,
+                text=text,
+                message_date=raw_date,
+                message_url=self._post_url(source, message.id),
+                prefilter_priority=self._analysis_priority(text, reply is not None),
+                analysis_status=status,
+                alert_eligible=False,
+            )
+            saved += int(created)
+        logger.info(
+            "Telegram analysis backfill source_id=%s fetched=%s saved=%s",
+            source.id, len(messages), saved,
+        )
+        return AnalysisBackfillResult(source.id, len(messages), saved)
+
+    @staticmethod
+    def _analysis_priority(text: str | None, has_reply: bool) -> int:
+        # Local import avoids coupling the legacy collector module at import time.
+        from app.services.telegram_monitoring import prefilter_priority
+
+        return prefilter_priority(text, has_reply=has_reply)
 
     async def sync_comments(
         self,

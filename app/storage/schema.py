@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS telegram_messages (
     analysis_attempts INTEGER NOT NULL DEFAULT 0,
     last_analysis_error TEXT,
     next_analysis_at TEXT,
+    alert_eligible INTEGER NOT NULL DEFAULT 1,
     UNIQUE(source_id, telegram_message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_tg_messages_pending
@@ -424,6 +425,10 @@ async def _ensure_telegram_monitoring_columns(database: Database) -> None:
         columns = {row["name"] for row in await cursor.fetchall()}
     if columns and "next_analysis_at" not in columns:
         await connection.execute("ALTER TABLE telegram_messages ADD COLUMN next_analysis_at TEXT")
+    if columns and "alert_eligible" not in columns:
+        await connection.execute(
+            "ALTER TABLE telegram_messages ADD COLUMN alert_eligible INTEGER NOT NULL DEFAULT 1"
+        )
 
     # Verify reviews columns
     async with connection.execute("PRAGMA table_info(reviews)") as cursor:

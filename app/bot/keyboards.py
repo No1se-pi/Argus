@@ -8,6 +8,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📊 Дашборды", callback_data="menu:dash"),
                 InlineKeyboardButton(text="🔔 Алерты", callback_data="menu:alerts"),
             ],
+            [InlineKeyboardButton(text="🔭 TG Аналитика", callback_data="tgm:stats:1:all")],
             [
                 InlineKeyboardButton(text="🟦 VK", callback_data="vk:menu"),
                 InlineKeyboardButton(text="✈️ Telegram", callback_data="tg:menu"),
@@ -95,8 +96,9 @@ def telegram_menu_keyboard(available: bool) -> InlineKeyboardMarkup:
         )
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="🔭 Статистика сообщений", callback_data="tgm:stats:1:all")],
             [
-                InlineKeyboardButton(text="📊 Сводка", callback_data="tgm:digest"),
+                InlineKeyboardButton(text="📝 AI-сводка", callback_data="tgm:digest"),
                 InlineKeyboardButton(text="🚨 Требуют внимания", callback_data="tgm:alerts:7:all"),
             ],
             [
@@ -140,6 +142,25 @@ def monitoring_alerts_keyboard(days: int = 7, severity: int | None = None) -> In
                 InlineKeyboardButton(text="Все", callback_data=f"tgm:alerts:{days}:all"),
             ],
             [InlineKeyboardButton(text="⬅️ Telegram Monitoring", callback_data="tg:menu")],
+        ]
+    )
+
+
+def monitoring_stats_keyboard(days: int = 1) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Сегодня", callback_data="tgm:stats:1:all"),
+                InlineKeyboardButton(text="7 дней", callback_data="tgm:stats:7:all"),
+                InlineKeyboardButton(text="30 дней", callback_data="tgm:stats:30:all"),
+            ],
+            [
+                InlineKeyboardButton(text="🚨 Алерты", callback_data=f"tgm:alerts:{days}:all"),
+                InlineKeyboardButton(text="📈 Графики", callback_data="tgm:charts"),
+            ],
+            [InlineKeyboardButton(text="⏪ Загрузить последние 50", callback_data="tgm:backfill:50")],
+            [InlineKeyboardButton(text="⬅️ Telegram Monitoring", callback_data="tg:menu")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
         ]
     )
 

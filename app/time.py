@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import datetime, time, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -24,3 +24,11 @@ def local_now(name: str) -> datetime:
 
 def local_date_iso(name: str) -> str:
     return local_now(name).date().isoformat()
+
+
+def period_utc_bounds(name: str, days: int) -> tuple[str, str]:
+    zone = resolve_timezone(name)
+    now = datetime.now(zone)
+    start_date = now.date() - timedelta(days=max(1, days) - 1)
+    start = datetime.combine(start_date, time.min, tzinfo=zone).astimezone(UTC)
+    return start.isoformat(), now.astimezone(UTC).isoformat()

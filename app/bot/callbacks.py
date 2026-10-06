@@ -23,6 +23,7 @@ from app.bot.keyboards import (
     main_menu_keyboard,
     modules_keyboard,
     monitoring_alerts_keyboard,
+    monitoring_stats_keyboard,
     reviews_menu_keyboard,
     reviews_sources_keyboard,
     settings_keyboard,
@@ -59,7 +60,7 @@ from app.storage.repositories import (
     TelegramMonitoringRepository,
 )
 from app.telegram_auth import TelegramAuthService
-from app.time import local_date_iso
+from app.time import local_date_iso, period_utc_bounds
 from app.vk.service import VKService
 
 logger = logging.getLogger(__name__)
@@ -242,6 +243,116 @@ async def monitoring_llm_callback(
     latency = ollama_client.average_latency_ms if ollama_client else None
     runtime = (
         f"\nСредняя latency: <b>{latency} ms</b>" if latency is not None else ""
+    )
+
+
+@router.callback_query(F.data.startswith("tgm:stats:"))
+async def monitoring_stats_callback(
+    query: CallbackQuery,
+    settings: Settings,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+    source_repo: SourceRepository,
+) -> None:
+    parts = (query.data or "").split(":")
+    try:
+        days = int(parts[2])
+        source_id = None if parts[3] == "all" else int(parts[3])
+    except (IndexError, ValueError):
+        await query.answer("Некорректный период", show_alert=True)
+        return
+    if days not in {1, 7, 30}:
+        await query.answer("Некорректный период", show_alert=True)
+        return
+    start_iso, end_iso = period_utc_bounds(settings.timezone, days)
+    stats = await telegram_monitoring_repo.monitoring_summary(start_iso, end_iso, source_id)
+    period_name = "сегодня" if days == 1 else f"{days} дней"
+    lines = [
+        f"🔭 <b>Telegram Analytics — {period_name}</b>",
+        "",
+        f"Собрано сообщений: <b>{stats['collected']}</b>",
+        f"Проанализировано: <b>{stats['analyzed']}</b>",
+        f"Очередь: <b>{stats['pending']}</b> · отложено: <b>{stats['deferred']}</b>",
+        f"Ошибки анализа: <b>{stats['errors']}</b>",
+        "",
+        "<b>Настроение:</b>",
+        f"🟢 positive: {stats['positive']}",
+        f"⚪ neutral: {stats['neutral']}",
+        f"🔴 negative: {stats['negative']}",
+        "",
+        "<b>Риски:</b>",
+        f"🟡 severity 1: {stats['severity_1']}",
+        f"🟠 severity 2: {stats['severity_2']}",
+        f"🔴 severity 3: {stats['severity_3']}",
+    ]
+    if stats["topics"]:
+        lines.extend(["", "<b>Темы:</b>"])
+        lines.extend(
+            f"• {escape(item['label'])}: {item['count']}" for item in stats["topics"]
+        )
+    if stats["sources"]:
+        lines.extend(["", "<b>По источникам:</b>"])
+        lines.extend(
+            f"• {escape(item['label'])}: {item['count']}" for item in stats["sources"]
+        )
+    if stats["recent"]:
+        lines.extend(["", "<b>Последние сообщения:</b>"])
+        for item in stats["recent"]:
+            severity = item["severity"] if item["severity"] is not None else "—"
+            lines.append(
+                f"• {escape(item['source_title'])} · S{severity} · "
+                f"{escape((item['text'] or '[без текста]')[:140])}"
+            )
+    else:
+        lines.extend(["", "Новых сообщений за выбранный период пока нет."])
+
+    source_rows = []
+    for source in await source_repo.list_sources():
+        source_rows.append([
+            InlineKeyboardButton(
+                text=f"📡 {source.display_name[:28]}",
+                callback_data=f"tgm:stats:{days}:{source.id}",
+            )
+        ])
+    base_rows = monitoring_stats_keyboard(days).inline_keyboard
+    await _edit(
+        query,
+        "\n".join(lines),
+        InlineKeyboardMarkup(inline_keyboard=source_rows + base_rows),
+    )
+
+
+@router.callback_query(F.data.startswith("tgm:backfill:"))
+async def monitoring_backfill_callback(
+    query: CallbackQuery,
+    collector: TelegramCollector | None,
+    source_repo: SourceRepository,
+) -> None:
+    if collector is None:
+        await query.answer("Telethon collector недоступен", show_alert=True)
+        return
+    try:
+        limit = max(1, min(int((query.data or "").rsplit(":", 1)[-1]), 200))
+    except ValueError:
+        await query.answer("Некорректный лимит", show_alert=True)
+        return
+    await query.answer("Загружаю историю для анализа…")
+    fetched = saved = failed = 0
+    for source in await source_repo.list_sources():
+        try:
+            result = await collector.backfill_analysis(source, limit)
+            fetched += result.fetched_count
+            saved += result.saved_count
+        except Exception:
+            logger.exception("Analysis backfill failed source_id=%s", source.id)
+            failed += 1
+    await _edit(
+        query,
+        "⏪ <b>История загружена</b>\n\n"
+        f"Получено: <b>{fetched}</b>\n"
+        f"Добавлено в анализ: <b>{saved}</b>\n"
+        f"Ошибок источников: <b>{failed}</b>\n\n"
+        "Исторические сообщения попадут в статистику, но не создадут старые алерты.",
+        monitoring_stats_keyboard(1),
     )
     if ollama_client and ollama_client.last_error:
         runtime += f"\nПоследняя ошибка: {escape(ollama_client.last_error[:200])}"
