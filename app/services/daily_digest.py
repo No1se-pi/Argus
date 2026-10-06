@@ -82,6 +82,7 @@ class DailyDigestService:
             return (await self.llm_client.generate(
                 system="Return a concise Russian monitoring summary. Do not invent facts.",
                 prompt=digest_prompt(aggregates) + "\n/no_think",
+                json_mode=False,
             )).strip()
         except (OllamaUnavailable, ValueError) as exc:
             logger.warning("Daily digest LLM summary unavailable: %s", exc)

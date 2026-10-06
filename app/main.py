@@ -107,6 +107,7 @@ async def main() -> None:
         reviews_scheduler=reviews_scheduler,
         telegram_monitoring_repo=repositories.telegram_monitoring,
         digest_service=digest_service,
+        ollama_client=ollama,
     )
 
     schedulers = []

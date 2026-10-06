@@ -188,6 +188,11 @@ class ModuleRegistry:
             )
         if self.ollama_client is not None:
             details.append(f"Ollama model: {self.ollama_client.model or 'not configured'}")
+            latency = self.ollama_client.average_latency_ms
+            if latency is not None:
+                details.append(f"Ollama average latency: {latency} ms")
+            if self.ollama_client.last_error:
+                details.append(f"Ollama failures: {self.ollama_client.failure_count}")
         return ModuleInfo(
             name="Telegram Monitor",
             enabled=True,

@@ -205,3 +205,31 @@ async def test_deferred_queue_promotion_preserves_messages(tmp_path):
     rows = await repositories.telegram_monitoring.pending(10)
     assert [row["id"] for row in rows] == [deferred_id]
     await database.close()
+
+
+@pytest.mark.asyncio
+async def test_digest_requests_plain_text_from_ollama():
+    class FakeLlm:
+        def __init__(self):
+            self.json_mode = None
+
+        async def generate(self, *, system, prompt, json_mode=True):
+            self.json_mode = json_mode
+            return "Краткая сводка"
+
+    class FakeMonitoring:
+        async def digest_rows(self, date, source_id=None):
+            return [{
+                "source_id": 1, "sentiment": "neutral", "topic": "event",
+                "severity": 0, "text": "message",
+            }]
+
+    llm = FakeLlm()
+    repositories = SimpleNamespace(telegram_monitoring=FakeMonitoring())
+    settings = SimpleNamespace(alert_chat_id=None, admin_ids={123})
+    service = DailyDigestService(
+        settings=settings, repositories=repositories, bot=SimpleNamespace(), llm_client=llm
+    )
+    text = await service.build("2026-10-06")
+    assert llm.json_mode is False
+    assert "Краткая сводка" in text

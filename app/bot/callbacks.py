@@ -50,6 +50,7 @@ from app.config import Settings
 from app.modules import ModuleRegistry, ModuleStatus
 from app.reviews.models import ReviewsSyncAlreadyRunningError
 from app.services.daily_digest import DailyDigestService
+from app.services.llm.ollama_client import OllamaClient
 from app.storage.models import Source
 from app.storage.repositories import (
     RuntimeSettingsRepository,
@@ -234,15 +235,22 @@ async def monitoring_llm_callback(
     query: CallbackQuery,
     settings: Settings,
     telegram_monitoring_repo: TelegramMonitoringRepository,
+    ollama_client: OllamaClient | None,
 ) -> None:
     queued = await telegram_monitoring_repo.pending_count()
     ready = settings.ollama_enabled and bool(settings.ollama_model)
+    latency = ollama_client.average_latency_ms if ollama_client else None
+    runtime = (
+        f"\nСредняя latency: <b>{latency} ms</b>" if latency is not None else ""
+    )
+    if ollama_client and ollama_client.last_error:
+        runtime += f"\nПоследняя ошибка: {escape(ollama_client.last_error[:200])}"
     await _edit(
         query,
         "🧠 <b>Ollama</b>\n\n"
         f"Статус: {'✅ настроена' if ready else '⚠️ не настроена'}\n"
         f"Модель: <code>{escape(settings.ollama_model or 'не задана')}</code>\n"
-        f"Очередь анализа: <b>{queued}</b>",
+        f"Очередь анализа: <b>{queued}</b>{runtime}",
         telegram_menu_keyboard(True),
     )
 
