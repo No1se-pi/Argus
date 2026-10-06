@@ -144,3 +144,64 @@ async def test_daily_aggregation_and_alert_feedback(tmp_path):
     assert "Сообщений: <b>1</b>" in digest
     assert "severity 2: 1" in digest
     await database.close()
+
+
+@pytest.mark.asyncio
+async def test_analysis_retry_backoff_and_reply_context(tmp_path):
+    database = Database(tmp_path / "argus.sqlite3")
+    await database.connect()
+    await init_schema(database)
+    repositories = RepositoryBundle(database)
+    source = await repositories.sources.upsert_telegram_source(
+        link="@reply", username="reply", title="Reply", entity_id=991,
+        access_hash=992, entity_type="channel",
+    )
+    await repositories.telegram_monitoring.save_message(
+        source_id=source.id, telegram_message_id=10, reply_to_message_id=None,
+        text="original context", message_date="2026-10-06T10:00:00+00:00",
+        message_url=None, prefilter_priority=0,
+    )
+    child_id, _ = await repositories.telegram_monitoring.save_message(
+        source_id=source.id, telegram_message_id=11, reply_to_message_id=10,
+        text="reply", message_date="2026-10-06T10:01:00+00:00",
+        message_url=None, prefilter_priority=1,
+    )
+    rows = await repositories.telegram_monitoring.pending(10)
+    child = next(row for row in rows if row["id"] == child_id)
+    assert child["reply_text"] == "original context"
+
+    await repositories.telegram_monitoring.mark_error(child_id, "Ollama unavailable")
+    pending_ids = {row["id"] for row in await repositories.telegram_monitoring.pending(10)}
+    assert child_id not in pending_ids
+    connection = database.require_connection()
+    async with connection.execute(
+        "SELECT analysis_attempts, next_analysis_at FROM telegram_messages WHERE id=?",
+        (child_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row["analysis_attempts"] == 1
+    assert row["next_analysis_at"] is not None
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_deferred_queue_promotion_preserves_messages(tmp_path):
+    database = Database(tmp_path / "argus.sqlite3")
+    await database.connect()
+    await init_schema(database)
+    repositories = RepositoryBundle(database)
+    source = await repositories.sources.upsert_telegram_source(
+        link="@queue", username="queue", title="Queue", entity_id=881,
+        access_hash=882, entity_type="channel",
+    )
+    deferred_id, created = await repositories.telegram_monitoring.save_message(
+        source_id=source.id, telegram_message_id=1, reply_to_message_id=None,
+        text="deferred", message_date="2026-10-06T10:00:00+00:00",
+        message_url=None, prefilter_priority=5, analysis_status="deferred",
+    )
+    assert created is True
+    assert await repositories.telegram_monitoring.pending(10) == []
+    assert await repositories.telegram_monitoring.promote_deferred(1) == 1
+    rows = await repositories.telegram_monitoring.pending(10)
+    assert [row["id"] for row in rows] == [deferred_id]
+    await database.close()

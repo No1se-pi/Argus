@@ -93,12 +93,19 @@ class TelegramRealtimeMonitor:
         raw_date = message.date
         if raw_date.tzinfo is None:
             raw_date = raw_date.replace(tzinfo=UTC)
+        queue_size = await self.repositories.telegram_monitoring.pending_count()
+        analysis_status = (
+            "deferred"
+            if queue_size >= self.settings.telegram_analysis_queue_limit
+            else "pending"
+        )
         _, created = await self.repositories.telegram_monitoring.save_message(
             source_id=source.id, telegram_message_id=message.id,
             reply_to_message_id=reply, text=text,
             message_date=raw_date.astimezone(UTC).isoformat(),
             message_url=telegram_message_link(source.username, source.telegram_entity_id, message.id),
             prefilter_priority=prefilter_priority(text, has_reply=reply is not None),
+            analysis_status=analysis_status,
         )
         if created:
             logger.info("Telegram message collected source_id=%s message_id=%s", source.id, message.id)
@@ -125,6 +132,12 @@ class AnalysisWorker:
 
     async def run(self) -> None:
         while not self._stop.is_set():
+            queue_size = await self.repositories.telegram_monitoring.pending_count()
+            available = max(0, self.settings.telegram_analysis_queue_limit - queue_size)
+            if available:
+                await self.repositories.telegram_monitoring.promote_deferred(
+                    min(self.settings.llm_batch_size, available)
+                )
             rows = await self.repositories.telegram_monitoring.pending(self.settings.llm_batch_size)
             eligible = [row for row in rows if self.settings.llm_analyze_all_messages or row["prefilter_priority"] > 0]
             if not eligible:
@@ -138,7 +151,9 @@ class AnalysisWorker:
     async def _process(self, row: dict) -> None:
         async with self._semaphore:
             try:
-                result = await self.classifier.classify(row["text"] or "")
+                result = await self.classifier.classify(
+                    row["text"] or "", reply_text=row.get("reply_text")
+                )
                 inserted = await self.repositories.telegram_monitoring.save_analysis(
                     row["id"], result, self.classifier.client.model, PROMPT_VERSION
                 )
@@ -149,7 +164,6 @@ class AnalysisWorker:
             except OllamaUnavailable as exc:
                 await self.repositories.telegram_monitoring.mark_error(row["id"], str(exc))
                 logger.warning("Ollama unavailable; analysis retained in queue: %s", exc)
-                await asyncio.sleep(2)
             except Exception as exc:
                 await self.repositories.telegram_monitoring.mark_error(row["id"], str(exc))
                 logger.warning("Telegram message analysis failed message_id=%s: %s", row["id"], exc)

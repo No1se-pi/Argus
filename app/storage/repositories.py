@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     from datetime import UTC
@@ -797,7 +797,7 @@ class TelegramMonitoringRepository:
     async def save_message(
         self, *, source_id: int, telegram_message_id: int, reply_to_message_id: int | None,
         text: str | None, message_date: str, message_url: str | None,
-        prefilter_priority: int,
+        prefilter_priority: int, analysis_status: str = "pending",
     ) -> tuple[int, bool]:
         connection = self.database.require_connection()
         now = utc_now_iso()
@@ -805,11 +805,11 @@ class TelegramMonitoringRepository:
             """
             INSERT OR IGNORE INTO telegram_messages (
                 source_id, telegram_message_id, reply_to_message_id, text, message_date,
-                message_url, prefilter_priority, collected_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                message_url, prefilter_priority, collected_at, analysis_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (source_id, telegram_message_id, reply_to_message_id, text, message_date,
-             message_url, prefilter_priority, now),
+             message_url, prefilter_priority, now, analysis_status),
         )
         created = cursor.rowcount == 1
         async with connection.execute(
@@ -823,11 +823,16 @@ class TelegramMonitoringRepository:
     async def pending(self, limit: int) -> list[dict]:
         connection = self.database.require_connection()
         async with connection.execute(
-            """SELECT m.*, s.title AS source_title, s.username AS source_username
+            """SELECT m.*, s.title AS source_title, s.username AS source_username,
+               reply.text AS reply_text
                FROM telegram_messages m JOIN sources s ON s.id = m.source_id
+               LEFT JOIN telegram_messages reply
+                 ON reply.source_id=m.source_id
+                AND reply.telegram_message_id=m.reply_to_message_id
                WHERE m.analysis_status IN ('pending', 'error')
+                 AND (m.next_analysis_at IS NULL OR m.next_analysis_at <= ?)
                ORDER BY m.prefilter_priority DESC, m.collected_at ASC LIMIT ?""",
-            (limit,),
+            (utc_now_iso(), limit),
         ) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
@@ -838,6 +843,21 @@ class TelegramMonitoringRepository:
         ) as cursor:
             row = await cursor.fetchone()
         return int(row["count"])
+
+    async def promote_deferred(self, limit: int) -> int:
+        if limit <= 0:
+            return 0
+        connection = self.database.require_connection()
+        cursor = await connection.execute(
+            """UPDATE telegram_messages SET analysis_status='pending'
+               WHERE id IN (
+                 SELECT id FROM telegram_messages WHERE analysis_status='deferred'
+                 ORDER BY prefilter_priority DESC, collected_at ASC LIMIT ?
+               )""",
+            (limit,),
+        )
+        await connection.commit()
+        return cursor.rowcount
 
     async def health_stats(self) -> dict[str, int]:
         connection = self.database.require_connection()
@@ -867,7 +887,8 @@ class TelegramMonitoringRepository:
              result.intent_level, result.reason, model, prompt_version, now),
         )
         await connection.execute(
-            "UPDATE telegram_messages SET analyzed_at=?, analysis_status='done', last_analysis_error=NULL WHERE id=?",
+            """UPDATE telegram_messages SET analyzed_at=?, analysis_status='done',
+               last_analysis_error=NULL, next_analysis_at=NULL WHERE id=?""",
             (now, message_id),
         )
         await connection.commit()
@@ -884,10 +905,18 @@ class TelegramMonitoringRepository:
 
     async def mark_error(self, message_id: int, error: str) -> None:
         connection = self.database.require_connection()
+        async with connection.execute(
+            "SELECT analysis_attempts FROM telegram_messages WHERE id=?", (message_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        attempts = int(row["analysis_attempts"] if row else 0) + 1
+        delay_seconds = min(900, 2 ** min(attempts, 9))
+        next_at = (datetime.now(UTC) + timedelta(seconds=delay_seconds)).isoformat()
         await connection.execute(
             """UPDATE telegram_messages SET analysis_status='error',
-               analysis_attempts=analysis_attempts+1, last_analysis_error=? WHERE id=?""",
-            (error[:500], message_id),
+               analysis_attempts=analysis_attempts+1, last_analysis_error=?,
+               next_analysis_at=? WHERE id=?""",
+            (error[:500], next_at, message_id),
         )
         await connection.commit()
 
