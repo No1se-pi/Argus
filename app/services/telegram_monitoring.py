@@ -100,8 +100,6 @@ class TelegramRealtimeMonitor:
             message_url=telegram_message_link(source.username, source.telegram_entity_id, message.id),
             prefilter_priority=prefilter_priority(text, has_reply=reply is not None),
         )
-        if source.last_message_id is None or message.id > source.last_message_id:
-            await self.repositories.sources.set_last_message_id(source.id, message.id)
         if created:
             logger.info("Telegram message collected source_id=%s message_id=%s", source.id, message.id)
 
