@@ -1018,7 +1018,8 @@ async def _initialize_source_baseline(
 
 
 async def _edit(query: CallbackQuery, text: str, reply_markup=None) -> None:
-    await query.answer()
+    with contextlib.suppress(TelegramBadRequest):
+        await query.answer()
     if query.message is None:
         return
     try:
@@ -1144,14 +1145,16 @@ async def reviews_sync_callback(
         return
     config = await reviews_service.effective_config()
     if not config.enabled:
-        await query.answer(
-            "Reviews Monitor выключен. Сначала включите мониторинг.",
-            show_alert=True,
-        )
+        with contextlib.suppress(TelegramBadRequest):
+            await query.answer(
+                "Reviews Monitor выключен. Сначала включите мониторинг.",
+                show_alert=True,
+            )
         if query.message:
             await query.message.answer("Reviews Monitor выключен. Сначала включите мониторинг.")
         return
-    await query.answer("Запуск ручной проверки 12 филиалов...")
+    with contextlib.suppress(TelegramBadRequest):
+        await query.answer("Запуск ручной проверки 12 филиалов...")
     try:
         results = await reviews_service.sync_all_sources(force=True)
         new_revs = sum(len(r.new_reviews) for r in results)
@@ -1176,12 +1179,14 @@ async def reviews_on_callback(
     reviews_scheduler: Any = None,
 ) -> None:
     if runtime_settings_repo is None:
-        await query.answer("Настройки недоступны.", show_alert=True)
+        with contextlib.suppress(TelegramBadRequest):
+            await query.answer("Настройки недоступны.", show_alert=True)
         return
     await runtime_settings_repo.set("enable_reviews_monitor", "true")
     if reviews_scheduler:
         reviews_scheduler.wake()
-    await query.answer("🟢 Reviews Monitor включен!")
+    with contextlib.suppress(TelegramBadRequest):
+        await query.answer("🟢 Reviews Monitor включен!")
     if reviews_service:
         config = await reviews_service.effective_config()
         stats = await reviews_service.repository.get_stats()
@@ -1198,12 +1203,14 @@ async def reviews_off_callback(
     reviews_scheduler: Any = None,
 ) -> None:
     if runtime_settings_repo is None:
-        await query.answer("Настройки недоступны.", show_alert=True)
+        with contextlib.suppress(TelegramBadRequest):
+            await query.answer("Настройки недоступны.", show_alert=True)
         return
     await runtime_settings_repo.set("enable_reviews_monitor", "false")
     if reviews_scheduler:
         reviews_scheduler.wake()
-    await query.answer("🔴 Reviews Monitor выключен!")
+    with contextlib.suppress(TelegramBadRequest):
+        await query.answer("🔴 Reviews Monitor выключен!")
     if reviews_service:
         config = await reviews_service.effective_config()
         stats = await reviews_service.repository.get_stats()

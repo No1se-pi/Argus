@@ -4,6 +4,7 @@ import logging
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from telethon import TelegramClient
 
@@ -41,8 +42,10 @@ async def main() -> None:
     await init_schema(database)
     repositories = RepositoryBundle(database)
 
+    session = AiohttpSession(timeout=30.0)
     bot = Bot(
         token=settings.bot_token.get_secret_value(),
+        session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     alert_service = AlertService(
@@ -160,7 +163,9 @@ async def main() -> None:
     try:
         with contextlib.suppress(asyncio.CancelledError):
             await dispatcher.start_polling(
-                bot, allowed_updates=dispatcher.resolve_used_update_types()
+                bot,
+                allowed_updates=dispatcher.resolve_used_update_types(),
+                polling_timeout=20,
             )
     finally:
         logger.info("Argus shutdown started")

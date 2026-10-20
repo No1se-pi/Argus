@@ -308,6 +308,28 @@ CREATE TABLE IF NOT EXISTS reviews (
 CREATE INDEX IF NOT EXISTS idx_reviews_source ON reviews(source_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_sent ON reviews(is_sent_to_telegram);
 CREATE INDEX IF NOT EXISTS idx_reviews_published ON reviews(published_at);
+
+CREATE TABLE IF NOT EXISTS review_ai_analyses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_id INTEGER NOT NULL UNIQUE REFERENCES reviews(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    summary TEXT,
+    sentiment TEXT,
+    severity TEXT,
+    criticism_found INTEGER DEFAULT 0,
+    has_hidden_negative INTEGER DEFAULT 0,
+    stars_text_conflict INTEGER DEFAULT 0,
+    requires_attention INTEGER DEFAULT 0,
+    model TEXT,
+    error_message TEXT,
+    retry_count INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_ai_status ON review_ai_analyses(status);
+CREATE INDEX IF NOT EXISTS idx_review_ai_review_id ON review_ai_analyses(review_id);
 """
 
 
@@ -317,6 +339,7 @@ async def init_schema(database: Database) -> None:
     await _ensure_source_columns(database)
     await _ensure_alert_columns(database)
     await _ensure_review_columns(database)
+    await _ensure_ai_analysis_table(database)
     await _ensure_telegram_monitoring_columns(database)
     await connection.commit()
 
@@ -448,3 +471,35 @@ async def _ensure_telegram_monitoring_columns(database: Database) -> None:
             reviews_migrations.append("ALTER TABLE reviews ADD COLUMN last_delivery_error TEXT")
         for stmt in reviews_migrations:
             await connection.execute(stmt)
+
+
+async def _ensure_ai_analysis_table(database: Database) -> None:
+    connection = database.require_connection()
+    await connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS review_ai_analyses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_id INTEGER NOT NULL UNIQUE REFERENCES reviews(id) ON DELETE CASCADE,
+            status TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            summary TEXT,
+            sentiment TEXT,
+            severity TEXT,
+            criticism_found INTEGER DEFAULT 0,
+            has_hidden_negative INTEGER DEFAULT 0,
+            stars_text_conflict INTEGER DEFAULT 0,
+            requires_attention INTEGER DEFAULT 0,
+            model TEXT,
+            error_message TEXT,
+            retry_count INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    await connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_review_ai_status ON review_ai_analyses(status)"
+    )
+    await connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_review_ai_review_id ON review_ai_analyses(review_id)"
+    )

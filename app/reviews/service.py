@@ -1,17 +1,21 @@
 import asyncio
 import logging
+import time
 from datetime import datetime
 
 try:
     from datetime import UTC
 except ImportError:
     from datetime import timezone
+
     UTC = timezone.utc  # noqa: UP017
 
 from app.alerts.service import AlertService
 from app.config import Settings
+from app.reviews.analyzer import GeminiReviewWorker
 from app.reviews.client_2gis import DGisReviewsClient
 from app.reviews.client_yandex import YandexReviewsClient
+from app.reviews.dates import parse_utc_datetime
 from app.reviews.models import (
     DEFAULT_SOURCES,
     ReviewItem,
@@ -37,6 +41,7 @@ class ReviewsService:
         alerts: AlertService,
         yandex_client: YandexReviewsClient | None = None,
         dgis_client: DGisReviewsClient | None = None,
+        ai_worker: GeminiReviewWorker | None = None,
     ) -> None:
         self.settings = settings
         self.runtime_settings = runtime_settings
@@ -46,6 +51,24 @@ class ReviewsService:
         self._dgis_client = dgis_client
         self._sync_lock = asyncio.Lock()
         self._default_sources_seeded = False
+        self._ai_worker = ai_worker
+        self._ai_worker_started = False
+        self._last_rating_alerts: dict[int, tuple[float, float, float]] = {}
+
+    def get_ai_worker(self) -> GeminiReviewWorker:
+        if self._ai_worker is None:
+            self._ai_worker = GeminiReviewWorker(
+                settings=self.settings,
+                repository=self.repository,
+                alerts=self.alerts,
+            )
+        return self._ai_worker
+
+    async def ensure_ai_worker_started(self) -> None:
+        worker = self.get_ai_worker()
+        if not self._ai_worker_started or worker._task is None or worker._task.done():
+            await worker.start()
+            self._ai_worker_started = True
 
     def _get_yandex_client(self) -> YandexReviewsClient:
         if self._yandex_client is None:
@@ -62,6 +85,9 @@ class ReviewsService:
             await self._yandex_client.close()
         if self._dgis_client is not None:
             await self._dgis_client.close()
+        if self._ai_worker is not None:
+            await self._ai_worker.stop()
+            self._ai_worker_started = False
 
     async def effective_config(self) -> ReviewsEffectiveConfig:
         runtime_enabled = await self.runtime_settings.get("enable_reviews_monitor")
@@ -117,9 +143,7 @@ class ReviewsService:
         latency_ms = int((asyncio.get_event_loop().time() - t_start) * 1000)
         consecutive = source.consecutive_errors + 1
         backoff_sec = min(300 * (2 ** (consecutive - 1)), config.max_backoff_seconds)
-        backoff_iso = datetime.fromtimestamp(
-            now_dt.timestamp() + backoff_sec, tz=UTC
-        ).isoformat()
+        backoff_iso = datetime.fromtimestamp(now_dt.timestamp() + backoff_sec, tz=UTC).isoformat()
 
         health_alert_active = source.health_alert_active
         health_alert_sent_at = source.health_alert_sent_at
@@ -143,8 +167,7 @@ class ReviewsService:
                     health_alert_sent_at = now_iso
                 else:
                     logger.warning(
-                        "Review health alert delivery failed, "
-                        "preserving state to retry next cycle"
+                        "Review health alert delivery failed, preserving state to retry next cycle"
                     )
             except Exception as alert_exc:
                 logger.error("Failed to send review health alert: %s", alert_exc)
@@ -169,6 +192,29 @@ class ReviewsService:
             http_status=http_code,
             latency_ms=latency_ms,
         )
+
+    async def _notify_recovery(self, source: ReviewSource) -> int:
+        # Handle successful fetch: send recovery alert if coming from degraded state
+        health_alert_active = source.health_alert_active
+        if source.health_alert_active == 1:
+            logger.info(
+                "Source %s (%s) recovered after degraded state. Dispatching recovery alert.",
+                source.branch_name,
+                source.platform,
+            )
+            try:
+                sent = await self.alerts.send_review_recovery_alert(source=source)
+                if sent:
+                    health_alert_active = 0
+                else:
+                    logger.warning(
+                        "Review recovery alert delivery failed, "
+                        "preserving active state to retry next cycle"
+                    )
+            except Exception as alert_exc:
+                logger.error("Failed to send review recovery alert: %s", alert_exc)
+
+        return health_alert_active
 
     async def sync_source(self, source: ReviewSource) -> ReviewSyncResult:
         now_dt = datetime.now(UTC)
@@ -199,11 +245,10 @@ class ReviewsService:
         # Call platform client
         if source.platform == ReviewPlatform.YANDEX:
             client = self._get_yandex_client()
-            status, items, err, http_code = await client.fetch_reviews(
-                source, page=1, page_size=config.fetch_page_size
-            )
-            branch_rating = None
-            total_count = None
+            res = await client.fetch_reviews(source, page=1, page_size=config.fetch_page_size)
+            status, items, err, http_code = res[:4]
+            branch_rating = res[4] if len(res) >= 5 else None
+            total_count = res[5] if len(res) >= 6 else None
         elif source.platform == ReviewPlatform.DGIS:
             d_client = self._get_dgis_client()
             (
@@ -221,6 +266,38 @@ class ReviewsService:
                 error_message=f"Unsupported platform: {source.platform}",
             )
 
+        # Validate rating and review count from platform response
+        if branch_rating is not None:
+            try:
+                b_rating_val = round(float(branch_rating), 1)
+                branch_rating = b_rating_val if 1.0 <= b_rating_val <= 5.0 else None
+            except (ValueError, TypeError):
+                branch_rating = None
+
+        # Guard against transient zeroes for count: never overwrite known positive count with 0
+        if total_count is not None:
+            try:
+                t_count_val = int(total_count)
+                if t_count_val < 0:
+                    total_count = None
+                elif (
+                    t_count_val == 0
+                    and source.total_reviews_count is not None
+                    and source.total_reviews_count > 0
+                ):
+                    logger.warning(
+                        "Source %s (%s) reported 0 total reviews while previously having %d; "
+                        "ignoring transient drop.",
+                        source.branch_name,
+                        source.platform,
+                        source.total_reviews_count,
+                    )
+                    total_count = source.total_reviews_count
+                else:
+                    total_count = t_count_val
+            except (ValueError, TypeError):
+                total_count = None
+
         # Handle failure
         if status not in (
             ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS,
@@ -229,26 +306,6 @@ class ReviewsService:
             return await self._handle_sync_failure(
                 source, status, err, http_code, now_dt, now_iso, t_start, config
             )
-
-        # Handle successful fetch: send recovery alert if coming from degraded state
-        health_alert_active = source.health_alert_active
-        if source.health_alert_active == 1:
-            logger.info(
-                "Source %s (%s) recovered after degraded state. Dispatching recovery alert.",
-                source.branch_name,
-                source.platform,
-            )
-            try:
-                sent = await self.alerts.send_review_recovery_alert(source=source)
-                if sent:
-                    health_alert_active = 0
-                else:
-                    logger.warning(
-                        "Review recovery alert delivery failed, "
-                        "preserving active state to retry next cycle"
-                    )
-            except Exception as alert_exc:
-                logger.error("Failed to send review recovery alert: %s", alert_exc)
 
         # Handle Cold Start Baseline
         if not source.is_initialized:
@@ -263,11 +320,15 @@ class ReviewsService:
                         await asyncio.sleep(config.request_pause_seconds)
 
                     if source.platform == ReviewPlatform.YANDEX:
-                        b_status, b_items, b_err, b_http_code = (
-                            await self._get_yandex_client().fetch_reviews(
-                                source, page=current_page, page_size=config.fetch_page_size
-                            )
+                        y_res = await self._get_yandex_client().fetch_reviews(
+                            source, page=current_page, page_size=config.fetch_page_size
                         )
+                        b_status, b_items, b_err, b_http_code = y_res[:4]
+                        if len(y_res) >= 6:
+                            if y_res[4] is not None:
+                                branch_rating = y_res[4]
+                            if y_res[5] is not None:
+                                total_count = y_res[5]
                     else:
                         (
                             b_status,
@@ -322,6 +383,12 @@ class ReviewsService:
             )
             await self.repository.save_reviews(baseline_items, source.id, mark_sent=True)
             await self.repository.mark_source_initialized(source.id)
+            baseline_effective_rating = (
+                branch_rating
+                if (branch_rating is not None and 1.0 <= branch_rating <= 5.0)
+                else None
+            )
+            health_alert_active = await self._notify_recovery(source)
             await self.repository.update_source_status(
                 source.id,
                 status="SUCCESS",
@@ -331,7 +398,7 @@ class ReviewsService:
                 health_alert_active=health_alert_active,
                 health_alert_sent_at=None,
                 backoff_until=None,
-                last_rating=branch_rating,
+                last_rating=baseline_effective_rating,
                 total_reviews_count=total_count,
             )
             return ReviewSyncResult(
@@ -344,11 +411,40 @@ class ReviewsService:
             )
 
         # Handle Deduplication & New Reviews
+        oldest_ts = (
+            await self.repository.get_oldest_review_published_at(source.id)
+            if source.is_initialized
+            else None
+        )
+        oldest_known_dt = parse_utc_datetime(oldest_ts) if oldest_ts else None
+
         new_items: list[ReviewItem] = []
+        historical_items: list[ReviewItem] = []
+        seen_ids: set[str] = set()
         for it in items:
-            is_known = await self.repository.is_review_known(it.platform, it.external_review_id)
+            rev_id = str(it.external_review_id)
+            if rev_id in seen_ids:
+                continue
+            is_known = await self.repository.is_review_known(it.platform, rev_id)
             if not is_known:
-                new_items.append(it)
+                it_dt = parse_utc_datetime(it.published_at)
+                if oldest_known_dt is not None and it_dt is not None and it_dt < oldest_known_dt:
+                    logger.info(
+                        "Review %s for %s (%s) is older than historical baseline (%s < %s). "
+                        "Marking as known historical review without alerting.",
+                        rev_id,
+                        source.branch_name,
+                        source.platform,
+                        it.published_at,
+                        oldest_ts,
+                    )
+                    historical_items.append(it)
+                    seen_ids.add(rev_id)
+                else:
+                    new_items.append(it)
+                    seen_ids.add(rev_id)
+
+        catchup_incomplete = len(new_items) > 0 and len(items) == config.fetch_page_size
 
         # Catch-up during downtime
         # If page 1 had >=1 new review AND page 1 was full,
@@ -360,16 +456,21 @@ class ReviewsService:
         ):
             current_page = 2
             total_fetched = len(items)
+            hit_historical_horizon = False
             while total_fetched < config.max_catchup_reviews:
                 if config.request_pause_seconds > 0:
                     await asyncio.sleep(config.request_pause_seconds)
 
                 if source.platform == ReviewPlatform.YANDEX:
-                    c_status, c_items, c_err, c_http_code = (
-                        await self._get_yandex_client().fetch_reviews(
-                            source, page=current_page, page_size=config.fetch_page_size
-                        )
+                    y_res = await self._get_yandex_client().fetch_reviews(
+                        source, page=current_page, page_size=config.fetch_page_size
                     )
+                    c_status, c_items, c_err, c_http_code = y_res[:4]
+                    if len(y_res) >= 6:
+                        if y_res[4] is not None:
+                            branch_rating = y_res[4]
+                        if y_res[5] is not None:
+                            total_count = y_res[5]
                 else:
                     (
                         c_status,
@@ -405,28 +506,82 @@ class ReviewsService:
                     )
 
                 if not c_items:
+                    catchup_incomplete = False
                     break
 
                 page_new_count = 0
-                for it in c_items:
-                    is_known = await self.repository.is_review_known(
-                        it.platform, it.external_review_id
-                    )
-                    if not is_known:
-                        new_items.append(it)
-                        page_new_count += 1
+                for idx, it in enumerate(c_items):
+                    rev_id = str(it.external_review_id)
+                    if rev_id in seen_ids:
+                        continue
+                    is_known = await self.repository.is_review_known(it.platform, rev_id)
+                    if is_known:
+                        continue
+
+                    it_dt = parse_utc_datetime(it.published_at)
+                    if (
+                        oldest_known_dt is not None
+                        and it_dt is not None
+                        and it_dt < oldest_known_dt
+                    ):
+                        logger.info(
+                            "Catch-up reached historical review %s for %s (%s) (%s < %s). "
+                            "Saving remaining page silently and terminating catch-up.",
+                            rev_id,
+                            source.branch_name,
+                            source.platform,
+                            it.published_at,
+                            oldest_ts,
+                        )
+                        historical_items.append(it)
+                        seen_ids.add(rev_id)
+                        hit_historical_horizon = True
+                        for rest_it in c_items[idx + 1 :]:
+                            rest_id = str(rest_it.external_review_id)
+                            if rest_id not in seen_ids:
+                                historical_items.append(rest_it)
+                                seen_ids.add(rest_id)
+                        break
+
+                    new_items.append(it)
+                    seen_ids.add(rev_id)
+                    page_new_count += 1
 
                 total_fetched += len(c_items)
 
+                if hit_historical_horizon:
+                    catchup_incomplete = False
+                    break
+
                 # Stop if this page had zero new reviews (all known)
                 if page_new_count == 0:
+                    catchup_incomplete = False
                     break
 
                 # Stop if end of stream reached (less than full page returned)
                 if len(c_items) < config.fetch_page_size:
+                    catchup_incomplete = False
                     break
 
                 current_page += 1
+
+        if catchup_incomplete:
+            return await self._handle_sync_failure(
+                source,
+                ReviewSyncStatus.UNKNOWN_ERROR,
+                "Catch-up limit reached before the known review boundary; "
+                "increase REVIEWS_MAX_CATCHUP_REVIEWS and retry. "
+                "No new reviews were marked as known.",
+                http_code,
+                now_dt,
+                now_iso,
+                t_start,
+                config,
+            )
+
+        # Silently persist any unindexed historical reviews (mark_sent=True)
+        if historical_items:
+            await self.repository.save_reviews(historical_items, source.id, mark_sent=True)
 
         # Sort new reviews chronologically: OLDEST to NEWEST
         new_items.sort(key=lambda r: r.published_at)
@@ -440,9 +595,97 @@ class ReviewsService:
                 source.branch_name,
                 source.platform,
             )
+            runtime_ai = await self.runtime_settings.get_bool(
+                "enable_gemini_review_analysis",
+                self.settings.enable_gemini_review_analysis,
+            )
+            if runtime_ai:
+                await self.ensure_ai_worker_started()
+                for r in new_items:
+                    if r.id is not None:
+                        self.get_ai_worker().enqueue(r.id)
         else:
             status = ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
 
+        # Check for rating change alert
+        # Both old and new ratings must be valid values in [1.0, 5.0] to prevent ghost alerts
+        # from transient zero/unrated responses
+        old_rating_val: float | None = None
+        if source.last_rating is not None:
+            try:
+                r_val = round(float(source.last_rating), 1)
+                if 1.0 <= r_val <= 5.0:
+                    old_rating_val = r_val
+            except (ValueError, TypeError):
+                old_rating_val = None
+
+        if (
+            source.is_initialized
+            and old_rating_val is not None
+            and branch_rating is not None
+            and 1.0 <= branch_rating <= 5.0
+            and old_rating_val != branch_rating
+            and config.alerts_enabled
+            and self.alerts
+        ):
+            now_ts = time.time()
+            last_alert = getattr(self, "_last_rating_alerts", {}).get(source.id)
+            is_flapping = False
+            if last_alert is not None:
+                alert_ts, prev_old, prev_new = last_alert
+                if (
+                    prev_new == old_rating_val
+                    and prev_old == branch_rating
+                    and (now_ts - alert_ts) < 3600.0
+                ):
+                    is_flapping = True
+                    logger.warning(
+                        "Suppressing flapping rating alert for %s (%s): %s -> %s "
+                        "(reverted within %.0fs)",
+                        source.branch_name,
+                        source.platform,
+                        old_rating_val,
+                        branch_rating,
+                        now_ts - alert_ts,
+                    )
+
+            if not is_flapping:
+                try:
+                    logger.info(
+                        "Rating changed for %s (%s): %s -> %s",
+                        source.branch_name,
+                        source.platform,
+                        old_rating_val,
+                        branch_rating,
+                    )
+                    effective_cnt = (
+                        total_count if total_count is not None else source.total_reviews_count
+                    )
+                    await self.alerts.send_rating_change_alert(
+                        source=source,
+                        old_rating=old_rating_val,
+                        new_rating=branch_rating,
+                        total_count=effective_cnt,
+                    )
+                    if not hasattr(self, "_last_rating_alerts"):
+                        self._last_rating_alerts = {}
+                    self._last_rating_alerts[source.id] = (now_ts, old_rating_val, branch_rating)
+                except Exception as rating_exc:
+                    logger.error("Failed to send rating change alert: %s", rating_exc)
+
+        # Do not overwrite valid last_rating with None if branch_rating failed to fetch
+        effective_rating = (
+            branch_rating
+            if (branch_rating is not None and 1.0 <= branch_rating <= 5.0)
+            else source.last_rating
+        )
+        effective_count = (
+            total_count
+            if (total_count is not None and (total_count > 0 or not source.total_reviews_count))
+            else source.total_reviews_count
+        )
+
+        health_alert_active = await self._notify_recovery(source)
         await self.repository.update_source_status(
             source.id,
             status=status.value if hasattr(status, "value") else str(status),
@@ -452,8 +695,8 @@ class ReviewsService:
             health_alert_active=health_alert_active,
             health_alert_sent_at=None,
             backoff_until=None,
-            last_rating=branch_rating,
-            total_reviews_count=total_count,
+            last_rating=effective_rating,
+            total_reviews_count=effective_count,
         )
 
         return ReviewSyncResult(
@@ -470,9 +713,21 @@ class ReviewsService:
         if not config.alerts_enabled:
             return 0
 
+        runtime_ai = await self.runtime_settings.get_bool(
+            "enable_gemini_review_analysis",
+            self.settings.enable_gemini_review_analysis,
+        )
+        if runtime_ai:
+            await self.ensure_ai_worker_started()
+
         unsent = await self.repository.get_unsent_reviews(limit=50)
         sent_count = 0
         for review in unsent:
+            if runtime_ai and getattr(review, "id", None):
+                ai = await self.repository.get_ai_analysis(review.id)
+                if ai is not None and ai.status == "PENDING":
+                    continue
+
             source = (
                 await self.repository.get_source_by_id(review.source_id)
                 if getattr(review, "source_id", None)
@@ -520,6 +775,19 @@ class ReviewsService:
             # Deliver any previously accumulated unsent reviews at the start of enabled cycle
             if config.alerts_enabled:
                 await self.deliver_pending_reviews()
+
+            # Re-enqueue any unanalyzed reviews for AI processing
+            runtime_ai = await self.runtime_settings.get_bool(
+                "enable_gemini_review_analysis",
+                self.settings.enable_gemini_review_analysis,
+            )
+            if runtime_ai:
+                await self.ensure_ai_worker_started()
+                worker = self.get_ai_worker()
+                unprocessed = await self.repository.get_pending_ai_reviews(limit=20)
+                for unproc in unprocessed:
+                    if unproc.id is not None:
+                        worker.enqueue(unproc.id)
 
             await self.ensure_default_sources()
             sources = await self.repository.list_sources(only_active=True)

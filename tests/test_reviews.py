@@ -117,8 +117,10 @@ async def test_env(tmp_path: Path):
     bundle = RepositoryBundle(database)
     settings = Settings(
         bot_token="123456:dummy_test_token",
+        alert_chat_id=None,
         admin_ids_text="99999",
         enable_reviews_monitor=True,
+        enable_gemini_review_analysis=False,
         reviews_poll_interval_seconds=900,
         reviews_request_pause_seconds=0.0,
         reviews_fetch_page_size=10,
@@ -965,7 +967,7 @@ async def test_parser_changed_http_200_invalid_schema(test_env):
         mock_opener.open.return_value = mock_resp_yandex
         client_yandex._opener = mock_opener
 
-        status, items, err, code = await client_yandex.fetch_reviews(yandex_source)
+        status, items, err, code, *_ = await client_yandex.fetch_reviews(yandex_source)
         assert status == ReviewSyncStatus.PARSER_FORMAT_CHANGED, f"Failed for {broken_json}"
         assert status != ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
         assert code == 200
@@ -1217,7 +1219,7 @@ async def test_yandex_403_refreshes_session_before_retry():
         mock_create_opener.return_value = mock_opener
         client._opener = mock_opener
 
-        status, items, err, code = await client.fetch_reviews(source)
+        status, items, err, code, *_ = await client.fetch_reviews(source)
 
         assert status == ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
         assert len(items) == 1
@@ -1225,6 +1227,85 @@ async def test_yandex_403_refreshes_session_before_retry():
         assert client._csrf_token == "fresh-csrf"
         assert client._session_id == "fresh-session"
         assert len(calls) == 3  # 1st fetchReviews (failed), page visit, 2nd fetchReviews (success)
+
+
+@pytest.mark.asyncio
+async def test_yandex_expired_csrf_http200_refreshes_session_before_retry():
+    client = YandexReviewsClient()
+    source = ReviewSource(
+        id=1,
+        platform=ReviewPlatform.YANDEX,
+        branch_name="Тест",
+        external_id="12345",
+        url="https://yandex.ru/maps/org/test/12345/",
+    )
+
+    client._csrf_token = "expired-csrf:12345"
+    client._session_id = "stale-session"
+    client._base_origin = "https://yandex.ru"
+
+    mock_resp_page = MagicMock()
+    mock_resp_page.geturl.return_value = "https://yandex.ru/maps/org/test/12345/"
+    mock_resp_page.read.return_value = (
+        b'<html><script type="application/json">{"config":{"csrfToken":"fresh-csrf",'
+        b'"counters":{"analytics":{"sessionId":"fresh-session"}}}}</script></html>'
+    )
+    mock_resp_page.__enter__.return_value = mock_resp_page
+    mock_resp_page.__exit__.return_value = None
+
+    # Yandex returns HTTP 200 with {"csrfToken": "new-csrf"} on token expiration
+    mock_resp_expired_csrf = MagicMock()
+    mock_resp_expired_csrf.read.return_value = json.dumps(
+        {"csrfToken": "fresh-csrf:99999"}
+    ).encode("utf-8")
+    mock_resp_expired_csrf.__enter__.return_value = mock_resp_expired_csrf
+    mock_resp_expired_csrf.__exit__.return_value = None
+
+    valid_reviews_json = json.dumps(
+        {
+            "data": {
+                "reviews": [
+                    {
+                        "reviewId": "rev-fresh-1",
+                        "rating": 5,
+                        "author": {"name": "Fresh User"},
+                        "text": "Great place",
+                        "updatedTime": "2026-09-10T12:00:00Z",
+                    }
+                ]
+            }
+        }
+    ).encode("utf-8")
+    mock_resp_api = MagicMock()
+    mock_resp_api.read.return_value = valid_reviews_json
+    mock_resp_api.__enter__.return_value = mock_resp_api
+    mock_resp_api.__exit__.return_value = None
+
+    calls = []
+
+    def fake_open(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        calls.append(url)
+        if "fetchReviews" in url and len([c for c in calls if "fetchReviews" in c]) == 1:
+            return mock_resp_expired_csrf
+        if "fetchReviews" in url:
+            return mock_resp_api
+        return mock_resp_page
+
+    with patch.object(client, "_create_opener") as mock_create_opener:
+        mock_opener = MagicMock()
+        mock_opener.open.side_effect = fake_open
+        mock_create_opener.return_value = mock_opener
+        client._opener = mock_opener
+
+        status, items, err, code, *_ = await client.fetch_reviews(source)
+
+        assert status == ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
+        assert len(items) == 1
+        assert items[0].external_review_id == "rev-fresh-1"
+        assert client._csrf_token == "fresh-csrf"
+        assert client._session_id == "fresh-session"
+        assert len(calls) == 3  # 1st fetchReviews (failed with csrfToken response), page visit, 2nd fetchReviews (success)
 
 
 @pytest.mark.asyncio
@@ -1262,7 +1343,7 @@ async def test_yandex_403_stops_after_max_one_retry():
         mock_create_opener.return_value = mock_opener
         client._opener = mock_opener
 
-        status, items, err, code = await client.fetch_reviews(source)
+        status, items, err, code, *_ = await client.fetch_reviews(source)
 
         assert status == ReviewSyncStatus.SOURCE_BLOCKED
         assert code == 403
@@ -1405,7 +1486,7 @@ async def test_yandex_missing_and_invalid_rating_never_becomes_five_stars():
         mock_opener.open.return_value = mock_resp
         client._opener = mock_opener
 
-        status, items, err, code = await client.fetch_reviews(source)
+        status, items, err, code, *_ = await client.fetch_reviews(source)
         assert status == ReviewSyncStatus.PARSER_FORMAT_CHANGED
         assert len(items) == 0
         assert "rating" in (err or "").lower()
@@ -1762,6 +1843,7 @@ async def test_multi_target_partial_failure_idempotent_retry(tmp_path: Path):
     bundle = RepositoryBundle(database)
     settings = Settings(
         bot_token="123456:dummy_test_token",
+        alert_chat_id=None,
         admin_ids_text="111,222",
         enable_reviews_monitor=True,
         alerts_reviews_enabled=True,
@@ -2436,3 +2518,528 @@ async def test_module_registry_reviews_status_crashing_and_degraded(test_env):
     assert info_degraded.status != ModuleStatus.OK
     assert info_degraded.is_available is False
     assert "Sources degraded: 1" in info_degraded.reason
+
+
+# ==============================================================================
+# 41. Date formatting in MSK without milliseconds/microseconds
+# ==============================================================================
+def test_format_msk_datetime():
+    from app.reviews.dates import format_msk_datetime
+
+    # 1. UTC Z date
+    d1 = "2026-10-01T16:32:34.241Z"
+    assert format_msk_datetime(d1) == "01.10.2026 19:32:34 МСК"
+
+    # 2. Offset +07:00 date (2GIS)
+    d2 = "2026-10-02T00:37:12.74127+07:00"
+    assert format_msk_datetime(d2) == "01.10.2026 20:37:12 МСК"
+
+    # 3. Microseconds +00:00
+    d3 = "2026-10-01T20:13:12.476877+00:00"
+    assert format_msk_datetime(d3) == "01.10.2026 23:13:12 МСК"
+
+    # 4. None / empty
+    assert format_msk_datetime(None) == "—"
+    assert format_msk_datetime("") == "—"
+
+
+# ==============================================================================
+# 42. Python 3.10 asyncio.TimeoutError compatibility in scheduler loop
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_scheduler_timeout_error_compatibility(test_env):
+    scheduler = ReviewsPollingScheduler(
+        settings=test_env["settings"],
+        service=test_env["service"],
+    )
+    # Simulate a poll cycle where wait_for times out in Python 3.10 style
+    # It must not increment _consecutive_loop_crashes
+    await scheduler._poll_cycle(wait_after=False)
+    assert scheduler.consecutive_crashes == 0
+
+
+# ==============================================================================
+# 43. Yandex client rating and count extraction
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_yandex_client_extracts_rating_and_count():
+    client = YandexReviewsClient()
+    source = ReviewSource(
+        id=1,
+        platform=ReviewPlatform.YANDEX,
+        branch_name="УО Датахаб",
+        external_id="1093602317",
+        url="https://yandex.ru/maps/org/datakhab/1093602317/reviews/",
+    )
+
+    page_html = (
+        '<html><body><script type="application/json">'
+        + json.dumps(
+            {
+                "config": {
+                    "csrfToken": "test_token",
+                    "counters": {"analytics": {"sessionId": "test_session"}},
+                    "locale": "ru_RU",
+                },
+                "stack": [
+                    {
+                        "results": {
+                            "items": [
+                                {
+                                    "ratingData": {
+                                        "ratingValue": 4.80000019,
+                                        "reviewCount": 293,
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ],
+            }
+        )
+        + "</script></body></html>"
+    )
+
+    fetch_json = {
+        "data": {
+            "reviews": [],
+            "params": {"count": 293, "page": 1},
+        }
+    }
+
+    mock_resp_page = MagicMock()
+    mock_resp_page.geturl.return_value = source.url
+    mock_resp_page.read.return_value = page_html.encode("utf-8")
+    mock_resp_page.__enter__.return_value = mock_resp_page
+    mock_resp_page.__exit__.return_value = False
+
+    mock_resp_fetch = MagicMock()
+    mock_resp_fetch.read.return_value = json.dumps(fetch_json).encode("utf-8")
+    mock_resp_fetch.__enter__.return_value = mock_resp_fetch
+    mock_resp_fetch.__exit__.return_value = False
+
+    with patch.object(client, "_create_opener") as mock_opener_factory:
+        mock_opener = MagicMock()
+        mock_opener.open.side_effect = [mock_resp_page, mock_resp_fetch]
+        mock_opener_factory.return_value = mock_opener
+        client._opener = mock_opener
+
+        status, items, err, code, rating, total = await client.fetch_reviews(source)
+        assert status == ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
+        assert rating == 4.8
+        assert total == 293
+
+
+# ==============================================================================
+# 44. Rating change triggers alert in ReviewsService
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_rating_change_triggers_alert(test_env):
+    service = test_env["service"]
+    bundle = test_env["bundle"]
+    bot = test_env["bot"]
+
+    await bundle.reviews.ensure_default_sources(DEFAULT_SOURCES)
+    source = await bundle.reviews.get_source_by_external_id("yandex", "1093602317")
+
+    # 1. First sync sets initial rating without alert
+    await bundle.reviews.mark_source_initialized(source.id)
+    await bundle.reviews.update_source_status(
+        source.id,
+        status="SUCCESS_NO_NEW_REVIEWS",
+        checked_at=datetime.now(UTC).isoformat(),
+        success=True,
+        last_rating=4.8,
+        total_reviews_count=290,
+    )
+    s_updated = await bundle.reviews.get_source_by_id(source.id)
+    assert s_updated.last_rating == 4.8
+
+    # 2. Rating changes to 4.9 on next cycle
+    test_env["yandex_client"].reviews_to_return = []
+    # Mock fetch_reviews to return new rating
+    async def mock_fetch_new_rating(src, page=1, page_size=10):
+        return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 4.9, 295
+
+    test_env["yandex_client"].fetch_reviews = mock_fetch_new_rating
+
+    bot.sent_messages.clear()
+    await service.sync_source(s_updated)
+
+    # Must send rating change alert to telegram
+    assert len(bot.sent_messages) == 1
+    msg_text = bot.sent_messages[0]["text"]
+    assert "📈 <b>Изменение рейтинга (Яндекс.Карты)</b>" in msg_text
+    assert "УО Датахаб" in msg_text
+    assert "4.8 ➔ <b>4.9</b> (+0.1 ⭐)" in msg_text
+    assert "<b>Всего отзывов:</b> 295" in msg_text
+
+
+# ==============================================================================
+# 45. Screen reviews_sources_text displays rating and review count
+# ==============================================================================
+def test_screens_reviews_sources_text_with_rating_and_count():
+    from app.bot.screens import reviews_sources_text
+    from app.reviews.models import ReviewSource
+
+    s = ReviewSource(
+        id=1,
+        branch_name="УО Датахаб",
+        platform=ReviewPlatform.YANDEX,
+        external_id="1093602317",
+        url="https://yandex.ru",
+        last_status="SUCCESS_NO_NEW_REVIEWS",
+        last_checked_at="2026-10-02T12:00:00Z",
+        last_rating=4.8,
+        total_reviews_count=293,
+    )
+
+    text = reviews_sources_text([s])
+    assert "⭐ 4.8 (293)" in text
+    assert "УО Датахаб" in text
+
+
+# ==============================================================================
+# 46. Transient zero rating and count drop never triggers alert and never corrupts DB
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_transient_zero_rating_and_count_never_triggers_alert_and_never_corrupts_db(test_env):
+    service = test_env["service"]
+    bundle = test_env["bundle"]
+    bot = test_env["bot"]
+
+    await bundle.reviews.ensure_default_sources(DEFAULT_SOURCES)
+    source = await bundle.reviews.get_source_by_external_id("yandex", "1092943436")
+
+    # 1. Initialize source with 5.0 rating and 189 reviews
+    await bundle.reviews.mark_source_initialized(source.id)
+    await bundle.reviews.update_source_status(
+        source.id,
+        status="SUCCESS_NO_NEW_REVIEWS",
+        checked_at=datetime.now(UTC).isoformat(),
+        success=True,
+        last_rating=5.0,
+        total_reviews_count=189,
+    )
+    s_updated = await bundle.reviews.get_source_by_id(source.id)
+    assert s_updated.last_rating == 5.0
+    assert s_updated.total_reviews_count == 189
+
+    # 2. Simulate Yandex transient glitch returning rating=0.0 and count=0
+    test_env["yandex_client"].reviews_to_return = []
+
+    async def mock_fetch_transient_zero(src, page=1, page_size=10):
+        return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 0.0, 0
+
+    test_env["yandex_client"].fetch_reviews = mock_fetch_transient_zero
+
+    bot.sent_messages.clear()
+    await service.sync_source(s_updated)
+
+    # Must NOT send any rating change alert to telegram
+    assert len(bot.sent_messages) == 0
+
+    # DB must preserve valid 5.0 rating and 189 reviews
+    s_after = await bundle.reviews.get_source_by_id(source.id)
+    assert s_after.last_rating == 5.0
+    assert s_after.total_reviews_count == 189
+
+    # 3. Next cycle returns normal 5.0 and 189 again
+    async def mock_fetch_normal(src, page=1, page_size=10):
+        return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 5.0, 189
+
+    test_env["yandex_client"].fetch_reviews = mock_fetch_normal
+    bot.sent_messages.clear()
+    await service.sync_source(s_after)
+
+    # Must NOT send any alert either (no false 0.0 -> 5.0 jump)
+    assert len(bot.sent_messages) == 0
+
+
+# ==============================================================================
+# 47. Yandex and 2GIS clients reject invalid rating <= 0 or > 5
+# ==============================================================================
+def test_yandex_client_rejects_zero_rating():
+    from app.reviews.client_yandex import YandexReviewsClient
+
+    client = YandexReviewsClient()
+    # HTML with ratingValue: 0
+    html_zero = """
+    <script type="application/json">
+    {"stack": [{"results": {"items": [{"ratingData": {"ratingValue": 0, "reviewCount": 0}}]}}]}
+    </script>
+    """
+    rating, count = client._parse_page_metadata(html_zero)
+    assert rating is None
+    assert count == 0
+
+    # HTML with valid rating
+    html_valid = """
+    <script type="application/json">
+    {"stack": [{"results": {"items": [{"ratingData": {"ratingValue": 4.9, "reviewCount": 50}}]}}]}
+    </script>
+    """
+    r_val, c_val = client._parse_page_metadata(html_valid)
+    assert r_val == 4.9
+    assert c_val == 50
+
+
+# ==============================================================================
+# 48. Historical reviews older than baseline do not trigger phantom alerts
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_unindexed_historical_reviews_do_not_trigger_phantom_alerts(test_env):
+    service = test_env["service"]
+    bundle = test_env["bundle"]
+
+    await bundle.reviews.ensure_default_sources(DEFAULT_SOURCES)
+    source = await bundle.reviews.get_source_by_external_id("2gis", "4504127908544789")
+
+    await bundle.reviews.mark_source_initialized(source.id)
+    source = await bundle.reviews.get_source_by_id(source.id)
+    # Seed baseline with reviews from September 2026
+    baseline_reviews = [
+        ReviewItem(
+            external_review_id=f"base-{i}",
+            platform=ReviewPlatform.DGIS,
+            branch_name=source.branch_name,
+            author_name=f"Base {i}",
+            rating=5,
+            text=f"Base text {i}",
+            published_at=f"2026-09-0{i}T10:00:00+03:00",
+        )
+        for i in range(1, 6)
+    ]
+    await bundle.reviews.save_reviews(baseline_reviews, source.id, mark_sent=True)
+
+    # Now a sync arrives with 1 genuine new review (today) + 1 resurrected historical review from 2025
+    real_new = ReviewItem(
+        external_review_id="real-new-1",
+        platform=ReviewPlatform.DGIS,
+        branch_name=source.branch_name,
+        author_name="Real New",
+        rating=5,
+        text="New positive review",
+        published_at="2026-10-05T12:00:00+03:00",
+    )
+    old_historical = ReviewItem(
+        external_review_id="old-hist-2025",
+        platform=ReviewPlatform.DGIS,
+        branch_name=source.branch_name,
+        author_name="Old Historical",
+        rating=5,
+        text="Old 2025 review not previously indexed",
+        published_at="2025-05-15T12:00:00+03:00",
+    )
+
+    async def mock_fetch(src, page=1, page_size=10):
+        return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, [real_new, old_historical] + baseline_reviews, None, 200, 5.0, 50
+
+    test_env["dgis_client"].fetch_reviews = AsyncMock(side_effect=mock_fetch)
+
+    result = await service.sync_source(source)
+
+    # ONLY the real new review must be reported as a new review!
+    assert len(result.new_reviews) == 1
+    assert result.new_reviews[0].external_review_id == "real-new-1"
+
+    # The historical review must be saved silently into database with mark_sent=True (is_sent_to_telegram = 1)
+    assert (await bundle.reviews.is_review_known("2gis", "old-hist-2025")) is True
+    connection = bundle.database.require_connection()
+    async with connection.execute(
+        "SELECT is_sent_to_telegram FROM reviews WHERE external_review_id = 'old-hist-2025'"
+    ) as cursor:
+        row = await cursor.fetchone()
+        assert row["is_sent_to_telegram"] == 1
+
+
+# ==============================================================================
+# 49. Catch-up terminates at historical baseline horizon without flooding alerts
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_catchup_stops_at_historical_baseline_horizon(test_env):
+    service = test_env["service"]
+    bundle = test_env["bundle"]
+
+    await bundle.reviews.ensure_default_sources(DEFAULT_SOURCES)
+    source = await bundle.reviews.get_source_by_external_id("2gis", "4504127908544789")
+
+    await bundle.reviews.mark_source_initialized(source.id)
+    source = await bundle.reviews.get_source_by_id(source.id)
+    # Baseline from Sept 2026 (10 reviews)
+    baseline_reviews = [
+        ReviewItem(
+            external_review_id=f"base-item-{i}",
+            platform=ReviewPlatform.DGIS,
+            branch_name=source.branch_name,
+            author_name=f"Base {i}",
+            rating=5,
+            text=f"Base text {i}",
+            published_at=f"2026-09-{10 + i:02d}T10:00:00+03:00",
+        )
+        for i in range(10)
+    ]
+    await bundle.reviews.save_reviews(baseline_reviews, source.id, mark_sent=True)
+
+    # Page 1: 1 new review + 9 baseline reviews (full 10 items) -> triggers catchup
+    real_new = ReviewItem(
+        external_review_id="real-new-today",
+        platform=ReviewPlatform.DGIS,
+        branch_name=source.branch_name,
+        author_name="Real New Today",
+        rating=5,
+        text="Real new review",
+        published_at="2026-10-05T12:00:00+03:00",
+    )
+    p1_items = [real_new] + baseline_reviews[:9]
+
+    # Page 2: Contains 10 historical reviews from 2025 that were never in SQLite
+    p2_items = [
+        ReviewItem(
+            external_review_id=f"old-2025-{i}",
+            platform=ReviewPlatform.DGIS,
+            branch_name=source.branch_name,
+            author_name=f"Old {i}",
+            rating=5,
+            text=f"Old text {i}",
+            published_at=f"2025-08-{10 + i:02d}T10:00:00+03:00",
+        )
+        for i in range(10)
+    ]
+
+    p3_called = False
+
+    async def mock_fetch(src, page=1, page_size=10):
+        nonlocal p3_called
+        if page == 1:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p1_items, None, 200, 5.0, 50
+        elif page == 2:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p2_items, None, 200, 5.0, 50
+        elif page == 3:
+            p3_called = True
+            return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 5.0, 50
+        return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 5.0, 50
+
+    test_env["dgis_client"].fetch_reviews = AsyncMock(side_effect=mock_fetch)
+
+    result = await service.sync_source(source)
+
+    # ONLY 1 real review must be in new_reviews
+    assert len(result.new_reviews) == 1
+    assert result.new_reviews[0].external_review_id == "real-new-today"
+
+    # Catchup must NOT call page 3
+    assert p3_called is False
+
+    # All 2025 reviews on page 2 must be silently saved with is_sent_to_telegram=1
+    connection = bundle.database.require_connection()
+    async with connection.execute(
+        "SELECT COUNT(*) as cnt FROM reviews WHERE external_review_id LIKE 'old-2025-%' AND is_sent_to_telegram = 1"
+    ) as cursor:
+        row = await cursor.fetchone()
+        assert row["cnt"] == 10
+
+
+# ==============================================================================
+# 50. Open Doors Day: High-volume surge of 40 reviews handled without historical duplicates
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_open_doors_day_surge_up_to_40_reviews_handles_smoothly_without_historical_duplicates(test_env):
+    service = test_env["service"]
+    bundle = test_env["bundle"]
+
+    await bundle.reviews.ensure_default_sources(DEFAULT_SOURCES)
+    source = await bundle.reviews.get_source_by_external_id("yandex", "1093602317")
+
+    await bundle.reviews.mark_source_initialized(source.id)
+    source = await bundle.reviews.get_source_by_id(source.id)
+
+    # 1. Existing baseline: 20 historical reviews from early 2026
+    baseline_reviews = [
+        ReviewItem(
+            external_review_id=f"hist-base-{i}",
+            platform=ReviewPlatform.YANDEX,
+            branch_name=source.branch_name,
+            author_name=f"Historical Author {i}",
+            rating=5,
+            text=f"Historical text {i}",
+            published_at=f"2026-03-{10 + i:02d}T10:00:00Z",
+        )
+        for i in range(20)
+    ]
+    await bundle.reviews.save_reviews(baseline_reviews, source.id, mark_sent=True)
+
+    # 2. Open Doors Day burst: 40 brand new reviews published today
+    surge_reviews = [
+        ReviewItem(
+            external_review_id=f"surge-open-day-{i:02d}",
+            platform=ReviewPlatform.YANDEX,
+            branch_name=source.branch_name,
+            author_name=f"Guest {i}",
+            rating=5,
+            text=f"Amazing Open Doors Day review #{i}",
+            published_at=f"2026-10-05T{10 + (i // 4):02d}:{(i % 4) * 15:02d}:00Z",
+        )
+        for i in range(40)
+    ]
+    # Reverse so newest is first on pages (as Yandex/2GIS return them)
+    surge_newest_first = list(reversed(surge_reviews))
+
+    p1 = surge_newest_first[0:10]
+    p2 = surge_newest_first[10:20]
+    p3 = surge_newest_first[20:30]
+    p4 = surge_newest_first[30:40]
+    p5 = baseline_reviews[:10]  # Already known in SQLite
+
+    p6_called = False
+
+    async def mock_fetch_yandex(src, page=1, page_size=10):
+        nonlocal p6_called
+        if page == 1:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p1, None, 200, 5.0, 60
+        elif page == 2:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p2, None, 200, 5.0, 60
+        elif page == 3:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p3, None, 200, 5.0, 60
+        elif page == 4:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p4, None, 200, 5.0, 60
+        elif page == 5:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p5, None, 200, 5.0, 60
+        elif page >= 6:
+            p6_called = True
+            return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 5.0, 60
+        return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 5.0, 60
+
+    test_env["yandex_client"].fetch_reviews = AsyncMock(side_effect=mock_fetch_yandex)
+
+    result = await service.sync_source(source)
+
+    # 1. Exactly 40 new reviews must be discovered
+    assert len(result.new_reviews) == 40
+    new_ids = {r.external_review_id for r in result.new_reviews}
+    expected_ids = {f"surge-open-day-{i:02d}" for i in range(40)}
+    assert new_ids == expected_ids
+
+    # 2. None of the baseline historical reviews leaked into new_reviews
+    assert not any(r.external_review_id.startswith("hist-base-") for r in result.new_reviews)
+
+    # 3. Catch-up stopped at Page 5 when seeing known baseline reviews (Page 6 never queried)
+    assert p6_called is False
+
+    # 4. Check DB: all 40 surge reviews are saved and pending delivery (is_sent_to_telegram = 0)
+    connection = bundle.database.require_connection()
+    async with connection.execute(
+        "SELECT COUNT(*) as cnt FROM reviews WHERE external_review_id LIKE 'surge-open-day-%' AND is_sent_to_telegram = 0"
+    ) as cur:
+        row = await cur.fetchone()
+        assert row["cnt"] == 40
+
+    # 5. Baseline historical reviews are untouched (is_sent_to_telegram = 1)
+    async with connection.execute(
+        "SELECT COUNT(*) as cnt FROM reviews WHERE external_review_id LIKE 'hist-base-%' AND is_sent_to_telegram = 1"
+    ) as cur:
+        row = await cur.fetchone()
+        assert row["cnt"] == 20
+
+
+

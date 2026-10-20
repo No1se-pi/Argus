@@ -20,6 +20,10 @@ logs/*
 .ruff_cache/
 dist/
 build/
-*.egg-info/
 sessions/
 *.env
+secrets/
+secrets/*.env
+*.egg-info/
+*.bak
+*.bak_*

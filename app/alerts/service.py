@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import json
 import logging
 from datetime import datetime
@@ -14,6 +16,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
 from app.config import Settings
+from app.reviews.dates import format_msk_datetime
 from app.storage.models import (
     Post,
     Source,
@@ -40,6 +43,14 @@ class AlertService:
         self.settings = settings
         self.alerts = alerts
         self.runtime_settings = runtime_settings
+        self._review_delivery_locks: dict[int, asyncio.Lock] = {}
+        self._review_locks_guard = asyncio.Lock()
+
+    async def _get_review_lock(self, review_id: int) -> asyncio.Lock:
+        async with self._review_locks_guard:
+            if review_id not in self._review_delivery_locks:
+                self._review_delivery_locks[review_id] = asyncio.Lock()
+            return self._review_delivery_locks[review_id]
 
     async def send_new_post_alert(self, source: Source, post: Post) -> None:
         if not await self._telegram_alert_enabled("post"):
@@ -420,7 +431,12 @@ class AlertService:
 
         return chunks if chunks else [raw_text]
 
-    def _render_review_parts(self, review: Any, source: Any) -> list[str]:
+    def _render_review_parts(
+        self,
+        review: Any,
+        source: Any,
+        ai_analysis: Any | None = None,
+    ) -> list[str]:
         platform_name = "Яндекс.Карты" if getattr(review, "platform", "") == "yandex" else "2ГИС"
         rating_num = getattr(review, "rating", 0) or 0
         stars = (
@@ -432,7 +448,7 @@ class AlertService:
             source, "branch_name", getattr(review, "branch_name", "Учебное отделение")
         )
         author = getattr(review, "author_name", "Аноним") or "Аноним"
-        published_at = getattr(review, "published_at", "")
+        published_at = format_msk_datetime(getattr(review, "published_at", ""))
         raw_text = getattr(review, "text", "") or "(без текста)"
         if raw_text.strip() == "TEXT_EMPTY":
             raw_text = "(без текста)"
@@ -440,8 +456,33 @@ class AlertService:
         review_url = getattr(review, "review_url", None)
         link_html = f'\n\n🔗 <a href="{escape(review_url)}">Открыть отзыв</a>' if review_url else ""
 
+        ai_header_block = ""
+        if ai_analysis is not None:
+            status = getattr(ai_analysis, "status", None)
+            verdict = getattr(ai_analysis, "verdict", "UNKNOWN")
+            if status == "SUCCESS":
+                badge_map = {
+                    "GREEN": "🟢 <b>Позитивный отзыв</b>",
+                    "YELLOW": "🟡 <b>Есть замечания</b>",
+                    "RED": "🔴 <b>Требует внимания</b>",
+                }
+                badge = badge_map.get(verdict, "")
+                lines = []
+                if badge:
+                    lines.append(badge)
+                summary = getattr(ai_analysis, "summary", None)
+                if summary:
+                    lines.append(f"🧠 <b>Кратко:</b> {escape(summary)}")
+                if getattr(ai_analysis, "stars_text_conflict", False):
+                    lines.append("⚠️ <i>Оценка может не соответствовать содержанию текста.</i>")
+                if lines:
+                    ai_header_block = "\n".join(lines) + "\n\n"
+            elif status in ("AI_ERROR", "QUOTA_PAUSED"):
+                ai_header_block = "⚪ <i>ИИ-анализ временно недоступен</i>\n\n"
+
         header_full = (
             "🆕 <b>Новый отзыв</b>\n\n"
+            f"{ai_header_block}"
             f"<b>Площадка:</b> {escape(platform_name)}\n"
             f"<b>Учебное отделение:</b> {escape(branch_name)}\n"
             f"<b>Автор:</b> {escape(author)}\n"
@@ -475,103 +516,184 @@ class AlertService:
 
         return parts
 
+    def _review_is_silent(self, review: Any, ai_analysis: Any | None) -> bool:
+        """Positive reviews are delivered without a push notification.
+
+        Silent only when the AI analysis succeeded and the verdict is GREEN and the
+        star rating is exactly 5. Anything uncertain (no analysis, failed
+        analysis, YELLOW, RED, low rating) stays loud, so nothing important is muted.
+        """
+        if not getattr(self.settings, "reviews_silent_green", True):
+            return False
+        if ai_analysis is None:
+            return False
+        if getattr(ai_analysis, "status", None) != "SUCCESS":
+            return False
+        if str(getattr(ai_analysis, "verdict", "")).upper() != "GREEN":
+            return False
+        rating = getattr(review, "rating", None)
+        # Only a clean 5-star review is muted; 4 stars and below always notify.
+        if not isinstance(rating, (int, float)) or rating != 5:
+            return False
+        return True
+
     async def send_review_alert(
         self,
         review: Any,
         source: Any,
-        repo: Any,
+        repo: Any = None,
+        ai_analysis: Any | None = None,
     ) -> bool:
         if not await self._reviews_alert_enabled():
             logger.info("Reviews alert skipped: disabled in settings")
             return False
 
-        chunks = self._render_review_parts(review, source)
-        total_parts = len(chunks)
-        targets = self._alert_targets()
+        review_id = getattr(review, "id", None)
+        lock = await self._get_review_lock(review_id) if review_id is not None else None
+        lock_ctx = lock if lock is not None else contextlib.nullcontext()
 
-        if not targets:
-            logger.warning("No alert targets configured for review alerts delivery")
+        async with lock_ctx:
+            if repo is not None and review_id is not None:
+                current_review = await repo.get_review_by_id(review_id)
+                if current_review is not None:
+                    if current_review.is_sent_to_telegram:
+                        logger.info(
+                            "Review %s already sent to Telegram, skipping duplicate delivery",
+                            review_id,
+                        )
+                        return True
+                    review = current_review
+
+            if ai_analysis is None and repo is not None and getattr(review, "id", None):
+                try:
+                    ai_analysis = await repo.get_ai_analysis(review.id)
+                except Exception as exc:
+                    logger.warning("Could not fetch ai_analysis for review %s: %s", review.id, exc)
+
+            chunks = self._render_review_parts(review, source, ai_analysis=ai_analysis)
+            total_parts = len(chunks)
+            targets = self._alert_targets()
+            silent = self._review_is_silent(review, ai_analysis)
+
+            if not targets:
+                logger.warning("No alert targets configured for review alerts delivery")
+                if repo is not None and hasattr(review, "id") and review.id:
+                    await repo.update_delivery_progress(
+                        review.id,
+                        parts_sent=0,
+                        parts_total=total_parts,
+                        is_sent=False,
+                        error="No alert targets configured",
+                        raw_payload_json=review.raw_payload_json
+                        if hasattr(review, "raw_payload_json")
+                        else None,
+                    )
+                return False
+
+            target_progress: dict[str, int] = {}
+            if hasattr(review, "raw_payload_json") and review.raw_payload_json:
+                try:
+                    payload = json.loads(review.raw_payload_json)
+                    if (
+                        isinstance(payload, dict)
+                        and "targets" in payload
+                        and isinstance(payload["targets"], dict)
+                    ):
+                        target_progress = {str(k): int(v) for k, v in payload["targets"].items()}
+                except Exception:
+                    pass
+
+            default_sent = getattr(review, "telegram_parts_sent", 0)
+            for chat_id in targets:
+                if str(chat_id) not in target_progress:
+                    target_progress[str(chat_id)] = default_sent
+
+            platform_str = (
+                review.platform.value
+                if hasattr(getattr(review, "platform", None), "value")
+                else str(getattr(review, "platform", "review"))
+            )
+            rev_id_str = str(getattr(review, "external_review_id", getattr(review, "id", "")))
+
+            first_exception: Exception | None = None
+
+            for chat_id in targets:
+                chat_str = str(chat_id)
+                current_sent = target_progress.get(chat_str, 0)
+                if current_sent >= total_parts:
+                    continue
+
+                for part_idx in range(current_sent, total_parts):
+                    chunk_text = chunks[part_idx]
+                    try:
+                        await self.bot.send_message(
+                            chat_id=chat_id,
+                            text=chunk_text,
+                            disable_web_page_preview=True,
+                            disable_notification=silent,
+                        )
+                        target_progress[chat_str] = part_idx + 1
+                        min_parts_sent = min(
+                            (target_progress.get(str(t), 0) for t in targets), default=0
+                        )
+                        payload_json = json.dumps({"targets": target_progress})
+                        if hasattr(review, "raw_payload_json"):
+                            review.raw_payload_json = payload_json
+                        if hasattr(review, "telegram_parts_sent"):
+                            review.telegram_parts_sent = min_parts_sent
+                        if repo is not None and hasattr(review, "id") and review.id:
+                            await repo.update_delivery_progress(
+                                review.id,
+                                parts_sent=min_parts_sent,
+                                parts_total=total_parts,
+                                is_sent=False,
+                                error=None,
+                                raw_payload_json=payload_json,
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to send review alert part %d to chat %s: %s",
+                            part_idx + 1,
+                            chat_id,
+                            exc,
+                        )
+                        if first_exception is None:
+                            first_exception = exc
+                        await self.alerts.create_platform_alert(
+                            platform=platform_str,
+                            source_id=None,
+                            item_type="review",
+                            item_id=rev_id_str,
+                            alert_type="new_review",
+                            chat_id=chat_id,
+                            message=chunk_text,
+                            status="failed",
+                            sent_at=None,
+                        )
+                        break
+
+            min_parts_sent = min((target_progress.get(str(t), 0) for t in targets), default=0)
+            all_completed = bool(targets) and all(
+                target_progress.get(str(t), 0) >= total_parts for t in targets
+            )
+            payload_json = json.dumps({"targets": target_progress})
+            if hasattr(review, "raw_payload_json"):
+                review.raw_payload_json = payload_json
+            if hasattr(review, "telegram_parts_sent"):
+                review.telegram_parts_sent = min_parts_sent
+
             if repo is not None and hasattr(review, "id") and review.id:
                 await repo.update_delivery_progress(
                     review.id,
-                    parts_sent=0,
+                    parts_sent=min_parts_sent,
                     parts_total=total_parts,
-                    is_sent=False,
-                    error="No alert targets configured",
-                    raw_payload_json=review.raw_payload_json
-                    if hasattr(review, "raw_payload_json")
-                    else None,
+                    is_sent=all_completed,
+                    error=str(first_exception) if first_exception else None,
+                    raw_payload_json=payload_json,
                 )
-            return False
 
-        target_progress: dict[str, int] = {}
-        if hasattr(review, "raw_payload_json") and review.raw_payload_json:
-            try:
-                payload = json.loads(review.raw_payload_json)
-                if (
-                    isinstance(payload, dict)
-                    and "targets" in payload
-                    and isinstance(payload["targets"], dict)
-                ):
-                    target_progress = {str(k): int(v) for k, v in payload["targets"].items()}
-            except Exception:
-                pass
-
-        default_sent = getattr(review, "telegram_parts_sent", 0)
-        for chat_id in targets:
-            if str(chat_id) not in target_progress:
-                target_progress[str(chat_id)] = default_sent
-
-        platform_str = (
-            review.platform.value
-            if hasattr(getattr(review, "platform", None), "value")
-            else str(getattr(review, "platform", "review"))
-        )
-        rev_id_str = str(getattr(review, "external_review_id", getattr(review, "id", "")))
-
-        first_exception: Exception | None = None
-
-        for chat_id in targets:
-            chat_str = str(chat_id)
-            current_sent = target_progress.get(chat_str, 0)
-            if current_sent >= total_parts:
-                continue
-
-            for part_idx in range(current_sent, total_parts):
-                chunk_text = chunks[part_idx]
-                try:
-                    await self.bot.send_message(
-                        chat_id=chat_id,
-                        text=chunk_text,
-                        disable_web_page_preview=True,
-                    )
-                    target_progress[chat_str] = part_idx + 1
-                    min_parts_sent = min(
-                        (target_progress.get(str(t), 0) for t in targets), default=0
-                    )
-                    payload_json = json.dumps({"targets": target_progress})
-                    if hasattr(review, "raw_payload_json"):
-                        review.raw_payload_json = payload_json
-                    if hasattr(review, "telegram_parts_sent"):
-                        review.telegram_parts_sent = min_parts_sent
-                    if repo is not None and hasattr(review, "id") and review.id:
-                        await repo.update_delivery_progress(
-                            review.id,
-                            parts_sent=min_parts_sent,
-                            parts_total=total_parts,
-                            is_sent=False,
-                            error=None,
-                            raw_payload_json=payload_json,
-                        )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to send review alert part %d to chat %s: %s",
-                        part_idx + 1,
-                        chat_id,
-                        exc,
-                    )
-                    if first_exception is None:
-                        first_exception = exc
+            if all_completed:
+                for chat_id in targets:
                     await self.alerts.create_platform_alert(
                         platform=platform_str,
                         source_id=None,
@@ -579,51 +701,16 @@ class AlertService:
                         item_id=rev_id_str,
                         alert_type="new_review",
                         chat_id=chat_id,
-                        message=chunk_text,
-                        status="failed",
-                        sent_at=None,
+                        message=chunks[0] if chunks else "",
+                        status="sent",
+                        sent_at=datetime.now(UTC).isoformat(),
                     )
-                    break
+                return True
 
-        min_parts_sent = min((target_progress.get(str(t), 0) for t in targets), default=0)
-        all_completed = bool(targets) and all(
-            target_progress.get(str(t), 0) >= total_parts for t in targets
-        )
-        payload_json = json.dumps({"targets": target_progress})
-        if hasattr(review, "raw_payload_json"):
-            review.raw_payload_json = payload_json
-        if hasattr(review, "telegram_parts_sent"):
-            review.telegram_parts_sent = min_parts_sent
+            if first_exception:
+                raise first_exception
 
-        if repo is not None and hasattr(review, "id") and review.id:
-            await repo.update_delivery_progress(
-                review.id,
-                parts_sent=min_parts_sent,
-                parts_total=total_parts,
-                is_sent=all_completed,
-                error=str(first_exception) if first_exception else None,
-                raw_payload_json=payload_json,
-            )
-
-        if all_completed:
-            for chat_id in targets:
-                await self.alerts.create_platform_alert(
-                    platform=platform_str,
-                    source_id=None,
-                    item_type="review",
-                    item_id=rev_id_str,
-                    alert_type="new_review",
-                    chat_id=chat_id,
-                    message=chunks[0] if chunks else "",
-                    status="sent",
-                    sent_at=datetime.now(UTC).isoformat(),
-                )
-            return True
-
-        if first_exception:
-            raise first_exception
-
-        return False
+            return False
 
     async def send_review_health_alert(self, source: Any, error_message: str) -> bool:
         if not await self._reviews_alert_enabled():
@@ -722,4 +809,45 @@ class AlertService:
                 logger.warning(
                     "Failed to send scheduler recovery alert to chat %s: %s", chat_id, exc
                 )
+        return delivered_any
+
+    async def send_rating_change_alert(
+        self,
+        source: Any,
+        old_rating: float,
+        new_rating: float,
+        total_count: int | None = None,
+    ) -> bool:
+        if not await self._reviews_alert_enabled():
+            return False
+        plat = getattr(source, "platform", "")
+        plat_val = plat.value if hasattr(plat, "value") else str(plat)
+        platform_name = "Яндекс.Карты" if plat_val == "yandex" else "2ГИС"
+        diff = round(new_rating - old_rating, 2)
+        diff_str = f"+{diff:.1f}" if diff > 0 else f"{diff:.1f}"
+        icon = "📈" if diff > 0 else "📉"
+        branch_name = getattr(source, "branch_name", "")
+        lines = [
+            f"{icon} <b>Изменение рейтинга ({escape(platform_name)})</b>\n",
+            f"<b>Отделение:</b> {escape(branch_name)}",
+            f"<b>Рейтинг:</b> {old_rating:.1f} ➔ <b>{new_rating:.1f}</b> ({diff_str} ⭐)",
+        ]
+        if total_count is not None:
+            lines.append(f"<b>Всего отзывов:</b> {total_count}")
+        url = getattr(source, "url", None)
+        if url:
+            lines.append(f'\n<a href="{escape(url)}">Открыть страницу отделения</a>')
+        msg = "\n".join(lines)
+        targets = self._alert_targets()
+        delivered_any = False
+        for chat_id in targets:
+            try:
+                await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=msg,
+                    disable_web_page_preview=True,
+                )
+                delivered_any = True
+            except Exception as exc:
+                logger.warning("Failed to send rating change alert to chat %s: %s", chat_id, exc)
         return delivered_any

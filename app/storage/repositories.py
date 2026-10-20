@@ -8,11 +8,13 @@ except ImportError:
     UTC = timezone.utc  # noqa: UP017
 
 from app.analytics.dashboard import DashboardService
+from app.reviews.dates import parse_utc_datetime
 from app.reviews.models import ReviewItem, ReviewPlatform, ReviewSource
 from app.storage.database import Database
 from app.storage.models import (
     Comment,
     Post,
+    ReviewAiAnalysis,
     Source,
     TelegramGroupMessage,
     TelegramKeyword,
@@ -1623,8 +1625,13 @@ class ReviewRepository:
             fields.append("backoff_until = NULL")
 
         if last_rating is not None:
-            fields.append("last_rating = ?")
-            params.append(last_rating)
+            try:
+                lr_val = round(float(last_rating), 1)
+                if 1.0 <= lr_val <= 5.0:
+                    fields.append("last_rating = ?")
+                    params.append(lr_val)
+            except (ValueError, TypeError):
+                pass
 
         if total_reviews_count is not None:
             fields.append("total_reviews_count = ?")
@@ -1644,6 +1651,29 @@ class ReviewRepository:
         ) as cursor:
             row = await cursor.fetchone()
         return row is not None
+
+    async def get_oldest_review_published_at(self, source_id: int) -> str | None:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT published_at FROM reviews
+            WHERE source_id = ? AND published_at IS NOT NULL AND published_at != ''
+            """,
+            (source_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        if not rows:
+            return None
+        dts: list[tuple[datetime, str]] = []
+        for r in rows:
+            raw = str(r["published_at"])
+            dt = parse_utc_datetime(raw)
+            if dt is not None:
+                dts.append((dt, raw))
+        if not dts:
+            return None
+        dts.sort(key=lambda x: x[0])
+        return dts[0][1]
 
     async def save_reviews(
         self,
@@ -1691,6 +1721,17 @@ class ReviewRepository:
             ) as cursor:
                 if cursor.rowcount > 0:
                     inserted_count += 1
+                    if cursor.lastrowid:
+                        r.id = cursor.lastrowid
+                        if not mark_sent:
+                            await connection.execute(
+                                """
+                                INSERT OR IGNORE INTO review_ai_analyses (
+                                    review_id, status, verdict, retry_count, created_at, updated_at
+                                ) VALUES (?, 'PENDING', 'UNKNOWN', 0, ?, ?)
+                                """,
+                                (cursor.lastrowid, now, now),
+                            )
         await connection.commit()
         return inserted_count
 
@@ -1792,6 +1833,151 @@ class ReviewRepository:
             "total_reviews": total_reviews,
             "unsent_reviews": unsent_reviews,
         }
+
+    async def get_review_by_id(self, review_id: int) -> ReviewItem | None:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT r.*, s.branch_name
+            FROM reviews r
+            JOIN review_sources s ON r.source_id = s.id
+            WHERE r.id = ?
+            LIMIT 1
+            """,
+            (review_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_review(row) if row else None
+
+    async def get_review_by_external_id(
+        self, platform: str, external_review_id: str
+    ) -> ReviewItem | None:
+        connection = self.database.require_connection()
+        platform_val = platform.value if hasattr(platform, "value") else str(platform)
+        async with connection.execute(
+            """
+            SELECT r.*, s.branch_name
+            FROM reviews r
+            JOIN review_sources s ON r.source_id = s.id
+            WHERE r.platform = ? AND r.external_review_id = ?
+            LIMIT 1
+            """,
+            (platform_val, str(external_review_id)),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_review(row) if row else None
+
+    async def get_ai_analysis(self, review_id: int) -> ReviewAiAnalysis | None:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            "SELECT * FROM review_ai_analyses WHERE review_id = ? LIMIT 1",
+            (review_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return ReviewAiAnalysis.from_row(row) if row else None
+
+    async def save_ai_analysis(self, analysis: ReviewAiAnalysis) -> ReviewAiAnalysis:
+        connection = self.database.require_connection()
+        now = utc_now_iso()
+        created_at = analysis.created_at or now
+        updated_at = now
+        await connection.execute(
+            """
+            INSERT INTO review_ai_analyses (
+                review_id, status, verdict, summary, sentiment, severity,
+                criticism_found, has_hidden_negative, stars_text_conflict,
+                requires_attention, model, error_message, retry_count,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(review_id) DO UPDATE SET
+                status = excluded.status,
+                verdict = excluded.verdict,
+                summary = excluded.summary,
+                sentiment = excluded.sentiment,
+                severity = excluded.severity,
+                criticism_found = excluded.criticism_found,
+                has_hidden_negative = excluded.has_hidden_negative,
+                stars_text_conflict = excluded.stars_text_conflict,
+                requires_attention = excluded.requires_attention,
+                model = excluded.model,
+                error_message = excluded.error_message,
+                retry_count = excluded.retry_count,
+                updated_at = excluded.updated_at
+            """,
+            (
+                analysis.review_id,
+                analysis.status,
+                analysis.verdict,
+                analysis.summary,
+                analysis.sentiment,
+                analysis.severity,
+                1 if analysis.criticism_found else 0,
+                1 if analysis.has_hidden_negative else 0,
+                1 if analysis.stars_text_conflict else 0,
+                1 if analysis.requires_attention else 0,
+                analysis.model,
+                analysis.error_message,
+                analysis.retry_count,
+                created_at,
+                updated_at,
+            ),
+        )
+        await connection.commit()
+        retrieved = await self.get_ai_analysis(analysis.review_id)
+        return retrieved if retrieved is not None else analysis
+
+    async def ensure_pending_ai_analysis(self, review_id: int) -> None:
+        connection = self.database.require_connection()
+        now = utc_now_iso()
+        await connection.execute(
+            """
+            INSERT OR IGNORE INTO review_ai_analyses (
+                review_id, status, verdict, retry_count, created_at, updated_at
+            ) VALUES (?, 'PENDING', 'UNKNOWN', 0, ?, ?)
+            """,
+            (review_id, now, now),
+        )
+        await connection.commit()
+
+    async def get_pending_ai_reviews(self, limit: int = 50) -> list[ReviewItem]:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT r.*, s.branch_name
+            FROM reviews r
+            JOIN review_sources s ON r.source_id = s.id
+            JOIN review_ai_analyses a ON r.id = a.review_id
+            WHERE a.status = 'PENDING' OR (a.status = 'AI_ERROR' AND a.retry_count < 3)
+            ORDER BY r.published_at ASC, r.id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_review(row) for row in rows]
+
+    async def update_ai_analysis_status(
+        self,
+        review_id: int,
+        status: str,
+        *,
+        error_message: str | None = None,
+        retry_count: int | None = None,
+    ) -> None:
+        connection = self.database.require_connection()
+        now = utc_now_iso()
+        fields = ["status = ?", "updated_at = ?"]
+        params: list[object] = [status, now]
+        if error_message is not None:
+            fields.append("error_message = ?")
+            params.append(error_message)
+        if retry_count is not None:
+            fields.append("retry_count = ?")
+            params.append(retry_count)
+        params.append(review_id)
+        query = f"UPDATE review_ai_analyses SET {', '.join(fields)} WHERE review_id = ?"
+        await connection.execute(query, tuple(params))
+        await connection.commit()
 
 
 class RepositoryBundle:

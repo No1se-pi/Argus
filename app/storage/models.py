@@ -255,3 +255,44 @@ class VkComment:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+
+@dataclass(frozen=True)
+class ReviewAiAnalysis:
+    id: int | None
+    review_id: int
+    status: str
+    verdict: str
+    summary: str | None = None
+    sentiment: str | None = None
+    severity: str | None = None
+    criticism_found: bool = False
+    has_hidden_negative: bool = False
+    stars_text_conflict: bool = False
+    requires_attention: bool = False
+    model: str | None = None
+    error_message: str | None = None
+    retry_count: int = 0
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    @classmethod
+    def from_row(cls, row: Row) -> "ReviewAiAnalysis":
+        return cls(
+            id=row["id"],
+            review_id=row["review_id"],
+            status=row["status"],
+            verdict=row["verdict"],
+            summary=row["summary"],
+            sentiment=row["sentiment"],
+            severity=row["severity"],
+            criticism_found=bool(row["criticism_found"]),
+            has_hidden_negative=bool(row["has_hidden_negative"]),
+            stars_text_conflict=bool(row["stars_text_conflict"]),
+            requires_attention=bool(row["requires_attention"]),
+            model=row["model"],
+            error_message=row["error_message"],
+            retry_count=int(row["retry_count"] or 0),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )

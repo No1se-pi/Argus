@@ -87,6 +87,12 @@ class ReviewsPollingScheduler:
     async def _poll_cycle(self, wait_after: bool = True) -> None:
         try:
             config = await self.service.effective_config()
+            runtime_ai = await self.service.runtime_settings.get_bool(
+                "enable_gemini_review_analysis",
+                self.service.settings.enable_gemini_review_analysis,
+            )
+            if runtime_ai and config.enabled:
+                await self.service.ensure_ai_worker_started()
 
             if not config.enabled:
                 self._state = "IDLE_DISABLED"
@@ -94,7 +100,7 @@ class ReviewsPollingScheduler:
                 if wait_after:
                     try:
                         await asyncio.wait_for(self._wake_event.wait(), timeout=5.0)
-                    except TimeoutError:
+                    except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
                         pass
                 return
 
@@ -112,7 +118,7 @@ class ReviewsPollingScheduler:
                             self._stop_event.wait(),
                             timeout=float(config.poll_interval_seconds),
                         )
-                    except TimeoutError:
+                    except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
                         pass
                 return
 
@@ -140,7 +146,7 @@ class ReviewsPollingScheduler:
                         self._stop_event.wait(),
                         timeout=float(config.poll_interval_seconds),
                     )
-                except TimeoutError:
+                except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
                     pass
 
         except asyncio.CancelledError:
@@ -173,12 +179,19 @@ class ReviewsPollingScheduler:
             if wait_after:
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=float(backoff))
-                except TimeoutError:
+                except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
                     pass
 
     async def run(self) -> None:
         self._started_at = datetime.now(UTC)
         logger.info("ReviewsPollingScheduler started")
+
+        runtime_ai = await self.service.runtime_settings.get_bool(
+            "enable_gemini_review_analysis",
+            self.service.settings.enable_gemini_review_analysis,
+        )
+        if runtime_ai:
+            await self.service.ensure_ai_worker_started()
 
         while not self._stop_event.is_set():
             try:
