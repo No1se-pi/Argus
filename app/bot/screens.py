@@ -24,7 +24,8 @@ async def main_menu_text(module_registry: ModuleRegistry) -> str:
             "",
             "✅ Bot UI",
             "✅ Database",
-            "✅ Scheduler",
+            ("✅ Фоновые мониторинги включены" if module_registry.settings.enable_background_monitors
+             else "⏸ Ручной режим: сбор и презентации по кнопкам"),
             module_lines,
             "",
             "Выбери раздел:",
@@ -41,7 +42,8 @@ async def status_text(module_registry: ModuleRegistry) -> str:
         "<b>Core:</b>",
         "✅ Bot UI: online",
         "✅ Database: online",
-        "✅ Scheduler: online",
+        ("✅ Фоновые мониторинги: включены" if module_registry.settings.enable_background_monitors
+         else "⏸ Фоновые мониторинги: выключены; ручные отчёты доступны"),
         "",
         "<b>Modules:</b>",
     ]

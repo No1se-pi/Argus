@@ -226,6 +226,14 @@ CREATE TABLE IF NOT EXISTS vk_posts (
 
 CREATE INDEX IF NOT EXISTS idx_vk_posts_group_date ON vk_posts(group_id, date);
 
+CREATE TABLE IF NOT EXISTS vk_like_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id INTEGER NOT NULL,
+    captured_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vk_like_reports_group ON vk_like_reports(group_id, id);
+
 CREATE TABLE IF NOT EXISTS vk_comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id INTEGER NOT NULL,

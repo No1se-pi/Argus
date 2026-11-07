@@ -30,7 +30,8 @@ class AdminOnlyMiddleware(BaseMiddleware):
         return await handler(event, data)
 
     async def _handle_denied_message(self, event: Message, data: dict[str, Any]) -> None:
-        command = (event.text or "").split(maxsplit=1)[0].split("@", maxsplit=1)[0].lower()
+        parts = (event.text or event.caption or "").split(maxsplit=1)
+        command = parts[0].split("@", maxsplit=1)[0].lower() if parts else ""
         if command in {"/start", "/request_access"} and event.from_user is not None:
             access_service = data.get("access_service")
             if isinstance(access_service, AccessRequestService):

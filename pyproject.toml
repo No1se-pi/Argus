@@ -12,6 +12,7 @@ dependencies = [
     "Telethon>=1.34,<2",
     "matplotlib>=3.8,<4",
     "tzdata>=2024.1",
+    "lxml>=5,<7",
 ]
 
 [tool.setuptools.packages.find]

@@ -572,6 +572,48 @@ async def test_new_review_triggers_alert(test_env):
     assert "Fresh Student" in bot.sent_messages[0]["text"]
 
 
+@pytest.mark.asyncio
+async def test_startup_cutoff_silences_newly_discovered_historical_reviews(test_env):
+    service = test_env["service"]
+    bundle = test_env["bundle"]
+    service.notify_since = datetime(2026, 11, 7, 4, tzinfo=UTC)
+    await bundle.reviews.ensure_default_sources(DEFAULT_SOURCES)
+    source = await bundle.reviews.get_source_by_external_id("yandex", "1093602317")
+    await bundle.reviews.mark_source_initialized(source.id)
+    source = await bundle.reviews.get_source_by_id(source.id)
+    test_env["yandex_client"].reviews_to_return = [
+        ReviewItem(external_review_id="old-at-restart", platform=ReviewPlatform.YANDEX,
+                   branch_name=source.branch_name, author_name="Old", rating=5, text="Old",
+                   published_at="2026-10-19T12:00:00Z"),
+        ReviewItem(external_review_id="genuinely-live", platform=ReviewPlatform.YANDEX,
+                   branch_name=source.branch_name, author_name="New", rating=5, text="New",
+                   published_at="2026-11-07T04:01:00Z"),
+    ]
+    result = await service.sync_source(source)
+    assert [item.external_review_id for item in result.new_reviews] == ["genuinely-live"]
+    assert await bundle.reviews.is_review_known("yandex", "old-at-restart")
+    assert await service.deliver_pending_reviews() == 1
+    assert len(test_env["bot"].sent_messages) == 1
+    assert "New" in test_env["bot"].sent_messages[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_startup_cutoff_does_not_replay_existing_failed_delivery_queue(test_env):
+    service = test_env["service"]
+    bundle = test_env["bundle"]
+    service.notify_since = datetime(2026, 11, 7, 4, tzinfo=UTC)
+    await bundle.reviews.ensure_default_sources(DEFAULT_SOURCES)
+    source = await bundle.reviews.get_source_by_external_id("yandex", "1093602317")
+    item = ReviewItem(external_review_id="pending-before-restart", platform=ReviewPlatform.YANDEX,
+                      branch_name=source.branch_name, author_name="Old", rating=5, text="Old",
+                      published_at="2026-10-19T12:00:00Z")
+    await bundle.reviews.save_reviews([item], source.id, mark_sent=False)
+    assert await service.deliver_pending_reviews() == 0
+    assert test_env["bot"].sent_messages == []
+    assert await bundle.reviews.get_unsent_reviews() == []
+    assert await bundle.reviews.is_review_known("yandex", item.external_review_id)
+
+
 # ==============================================================================
 # 12. Subsequent polling deduplication (no 2nd alert)
 # ==============================================================================

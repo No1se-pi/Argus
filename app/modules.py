@@ -78,6 +78,10 @@ class ModuleRegistry:
             "/vk_recent_comments",
             "/vk_sync",
             "/vk_dashboard",
+            "/vk_likes",
+            "/vk_likes_report",
+            "/vk_likes_pptx",
+            "/vk_likes_bind",
             "/vk_watch_on",
             "/vk_watch_off",
         ]
@@ -129,6 +133,20 @@ class ModuleRegistry:
                 status=ModuleStatus.DISABLED,
                 reason="Telegram Monitor is disabled",
                 available_commands=[],
+            )
+
+        if not self.settings.enable_background_monitors:
+            return ModuleInfo(
+                name="Telegram Monitor",
+                enabled=True,
+                status=ModuleStatus.DISABLED,
+                reason=(
+                    "Фоновый сбор приостановлен ручным режимом "
+                    "(ENABLE_BACKGROUND_MONITORS=false). Для возобновления укажите true "
+                    "и перезапустите бот. Повторная авторизация Telegram не требуется "
+                    "только из-за этой паузы."
+                ),
+                available_commands=["/tg_status"],
             )
 
         if not self.settings.has_telegram_monitor_config:

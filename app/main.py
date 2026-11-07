@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+from datetime import datetime, timezone
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -18,16 +19,19 @@ from app.reviews.scheduler import ReviewsPollingScheduler
 from app.reviews.service import ReviewsService
 from app.scheduler.jobs import BackgroundScheduler
 from app.scheduler.rate_limit import TelegramRateLimiter
+from app.services.daily_digest import DailyDigestScheduler, DailyDigestService
 from app.services.llm.classifier import MessageClassifier
 from app.services.llm.ollama_client import OllamaClient
-from app.services.daily_digest import DailyDigestScheduler, DailyDigestService
 from app.services.telegram_monitoring import AnalysisWorker, TelegramRealtimeMonitor
 from app.storage.database import Database
 from app.storage.repositories import RepositoryBundle
 from app.storage.schema import init_schema
 from app.telegram_auth import TelegramAuthService
+from app.vk.likes import VKLikesService
+from app.vk.likes_repository import VKLikesRepository
 from app.vk.scheduler import VKPollingScheduler
 from app.vk.service import VKService
+from app.vk.workspace import VKLikesWorkspace
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +39,7 @@ logger = logging.getLogger(__name__)
 async def main() -> None:
     settings = get_settings()
     setup_logging(settings.log_level)
+    started_at = datetime.now(timezone.utc)  # noqa: UP017 - Python 3.10
 
     database = Database(settings.database_path)
     await database.connect()
@@ -71,7 +76,11 @@ async def main() -> None:
         runtime_settings=repositories.runtime_settings,
         repository=repositories.reviews,
         alerts=alert_service,
+        notify_since=started_at,
     )
+    vk_likes_service = VKLikesService(vk_service, VKLikesRepository(database))
+    vk_likes_workspace = VKLikesWorkspace(vk_likes_service)
+    await vk_likes_workspace.seed_bindings()
     reviews_scheduler = ReviewsPollingScheduler(
         settings=settings,
         service=reviews_service,
@@ -100,6 +109,8 @@ async def main() -> None:
         module_registry=module_registry,
         vk_service=vk_service,
         runtime_settings_repo=repositories.runtime_settings,
+        vk_likes_service=vk_likes_service,
+        vk_likes_workspace=vk_likes_workspace,
         telegram_auth_service=telegram_auth_service,
         keyword_repo=repositories.keywords,
         access_service=access_service,
@@ -149,11 +160,13 @@ async def main() -> None:
         tasks.append(asyncio.create_task(digest_scheduler.run(), name="argus-daily-digest"))
 
     vk_scheduler = VKPollingScheduler(settings=settings, service=vk_service, alerts=alert_service)
-    schedulers.append(vk_scheduler)
-    tasks.append(asyncio.create_task(vk_scheduler.run(), name="argus-vk-scheduler"))
-
-    schedulers.append(reviews_scheduler)
-    tasks.append(asyncio.create_task(reviews_scheduler.run(), name="argus-reviews-scheduler"))
+    if settings.enable_background_monitors:
+        schedulers.append(vk_scheduler)
+        tasks.append(asyncio.create_task(vk_scheduler.run(), name="argus-vk-scheduler"))
+        schedulers.append(reviews_scheduler)
+        tasks.append(asyncio.create_task(reviews_scheduler.run(), name="argus-reviews-scheduler"))
+    else:
+        logger.info("Manual mode: background monitors and automatic alerts are off")
 
     logger.info("Argus started")
 
@@ -190,6 +203,8 @@ async def _start_telegram_monitor(
     settings,
     repositories: RepositoryBundle,
 ) -> tuple[TelegramClient | None, TelegramCollector | None]:
+    if not settings.enable_background_monitors:
+        return None, None
     if not settings.enable_telegram_monitor and not settings.require_telethon:
         logger.info("Telegram Monitor is disabled")
         return None, None

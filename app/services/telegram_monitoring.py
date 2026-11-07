@@ -1,12 +1,13 @@
 import asyncio
 import logging
 import re
-from datetime import timezone
+from datetime import datetime, timezone
 from html import escape
 
-from telethon import events, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from telethon import events, types
 
+from app.alerts.timing import is_live
 from app.services.llm.ollama_client import OllamaUnavailable
 from app.services.llm.prompts import PROMPT_VERSION
 
@@ -65,14 +66,31 @@ class TelegramRealtimeMonitor:
         for source in sources:
             try:
                 entity = self._entity(source)
-                kwargs = {"limit": self.settings.telegram_catchup_limit, "reverse": True}
-                if source.last_message_id:
-                    kwargs["min_id"] = source.last_message_id
+                latest = await self.client.get_messages(entity, limit=1)
+                if not latest:
+                    continue
+                head = max(message.id for message in latest if getattr(message, "id", None))
+                if source.last_message_id is None:
+                    await self.repositories.sources.set_last_message_id(source.id, head)
+                    logger.info(
+                        "Telegram baseline source_id=%s cursor=%s (0 historical alerts)",
+                        source.id, head,
+                    )
+                    continue
+                if head <= source.last_message_id:
+                    continue
+                kwargs = {"limit": self.settings.telegram_catchup_limit,
+                          "min_id": source.last_message_id, "max_id": head + 1}
                 messages = await self.client.get_messages(entity, **kwargs)
                 if len(messages) >= self.settings.telegram_catchup_limit:
                     logger.warning("Telegram catch-up limit reached source_id=%s", source.id)
-                for message in messages:
-                    await self._store(source, message)
+                for message in sorted(messages, key=lambda item: item.id):
+                    await self._store(source, message, alert_eligible=False)
+                await self.repositories.sources.set_last_message_id(source.id, head)
+                logger.info(
+                    "Telegram catch-up source_id=%s stored=%s cursor=%s (0 historical alerts)",
+                    source.id, len(messages), head,
+                )
             except Exception as exc:
                 logger.warning("Telegram source unavailable source_id=%s error=%s", source.id, exc)
 
@@ -85,7 +103,7 @@ class TelegramRealtimeMonitor:
         except Exception:
             logger.exception("Telethon unexpected exception while collecting message")
 
-    async def _store(self, source, message) -> None:
+    async def _store(self, source, message, *, alert_eligible: bool = True) -> None:
         if isinstance(message, types.MessageService) or not getattr(message, "id", None):
             return
         text = getattr(message, "message", None)
@@ -106,9 +124,10 @@ class TelegramRealtimeMonitor:
             message_url=telegram_message_link(source.username, source.telegram_entity_id, message.id),
             prefilter_priority=prefilter_priority(text, has_reply=reply is not None),
             analysis_status=analysis_status,
+            alert_eligible=alert_eligible,
         )
         if created:
-            logger.info("Telegram message collected source_id=%s message_id=%s", source.id, message.id)
+            logger.debug("Telegram message collected source_id=%s message_id=%s", source.id, message.id)
 
     def _entity(self, source):
         if source.telegram_entity_type == "channel" and source.telegram_access_hash is not None:
@@ -126,6 +145,7 @@ class AnalysisWorker:
         self.bot = bot
         self._stop = asyncio.Event()
         self._semaphore = asyncio.Semaphore(settings.llm_max_concurrent_requests)
+        self._started_at = datetime.now(UTC)
 
     def stop(self) -> None:
         self._stop.set()
@@ -160,6 +180,7 @@ class AnalysisWorker:
                 if (
                     inserted
                     and row["alert_eligible"]
+                    and is_live(row.get("message_date"), self._started_at)
                     and result.risk
                     and result.severity >= self.settings.llm_alert_min_severity
                 ):

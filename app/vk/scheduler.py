@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from app.alerts.service import AlertService
+from app.alerts.timing import is_live
 from app.config import Settings
 from app.vk.client import VKAPIError
 from app.vk.service import VKEffectiveConfig, VKService, VKSyncResult
@@ -29,6 +30,7 @@ class VKPollingScheduler:
         self._next_polling_sync_at: datetime | None = None
         self._logged_polling_unavailable = False
         self._last_config_summary: str | None = None
+        self._started_at = datetime.now(UTC)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -137,9 +139,11 @@ class VKPollingScheduler:
 
     async def _send_alerts(self, result: VKSyncResult) -> None:
         for post in result.new_posts:
-            await self.alerts.send_vk_post_alert(post)
+            if is_live(post.date, self._started_at):
+                await self.alerts.send_vk_post_alert(post)
         for comment in result.new_comments:
-            await self.alerts.send_vk_comment_alert(comment)
+            if is_live(comment.date, self._started_at):
+                await self.alerts.send_vk_comment_alert(comment)
 
     def _log_result(self, label: str, result: VKSyncResult) -> None:
         logger.info(

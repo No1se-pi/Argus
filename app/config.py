@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     )
 
     enable_telegram_bot_ui: bool = True
+    enable_background_monitors: bool = False
     enable_vk_monitor: bool = True
     enable_telegram_monitor: bool = False
     enable_reviews_monitor: bool = False

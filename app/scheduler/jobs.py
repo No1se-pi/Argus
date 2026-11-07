@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from app.alerts.service import AlertService
+from app.alerts.timing import is_live
 from app.collectors.telegram import LargeFloodWait, TelegramCollector
 from app.config import Settings
 from app.storage.models import Source
@@ -39,6 +40,7 @@ class BackgroundScheduler:
         self._stop_event = asyncio.Event()
         self._logged_disabled = False
         self._logged_no_sources = False
+        self._started_at = datetime.now(UTC)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -109,6 +111,8 @@ class BackgroundScheduler:
         )
         fresh_source = await self.sources.get_source(source.id) or source
         for post in result.new_posts:
+            if result.initialized or not is_live(post.date, self._started_at):
+                continue
             await self.alerts.send_new_post_alert(fresh_source, post)
             if self.keywords is None:
                 continue
@@ -134,13 +138,14 @@ class BackgroundScheduler:
         if result.initialized or not result.new_messages:
             return
         fresh_source = await self.sources.get_source(source.id) or source
+        fresh_messages = [item for item in result.new_messages if is_live(item.date, self._started_at)]
         alert_limit = self.settings.tg_comment_alerts_per_cycle
-        for message in result.new_messages[:alert_limit]:
+        for message in fresh_messages[:alert_limit]:
             await self.alerts.send_telegram_comment_alert(fresh_source, message)
-        if len(result.new_messages) > alert_limit:
+        if len(fresh_messages) > alert_limit:
             await self.alerts.send_telegram_comment_summary(
                 fresh_source,
-                total_count=len(result.new_messages),
+                total_count=len(fresh_messages),
                 sent_count=alert_limit,
             )
 

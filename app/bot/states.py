@@ -15,3 +15,9 @@ class TelegramAuthStates(StatesGroup):
 
 class TelegramSourceSetupStates(StatesGroup):
     waiting_forward = State()
+
+
+class VKLikesStates(StatesGroup):
+    waiting_period = State()
+    waiting_template = State()
+    waiting_binding = State()

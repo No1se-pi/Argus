@@ -568,16 +568,24 @@ class VKService:
         if config.group_id is None:
             missing.append("VK_GROUP_ID")
         missing_text = ", ".join(missing) if missing else "none"
+        token_source = (
+            ".env / переменная окружения VK_USER_ACCESS_TOKEN"
+            if self._secret_value(self.settings.vk_user_access_token)
+            else "настройки бота (SQLite)" if config.user_access_token else "не задан"
+        )
         return "\n".join(
             [
                 "<b>VK setup</b>",
                 f"Group token: {escape(group_token)}",
                 f"User token: {escape(user_token)}",
+                f"Источник пользовательского токена: {escape(token_source)}",
                 f"Group ID: {escape(group_id)}",
                 f"Missing: {escape(missing_text)}",
                 "",
                 "VK_GROUP_TOKEN нужен для Long Poll событий сообщества.",
                 "VK_USER_ACCESS_TOKEN нужен для /vk_sync истории через wall.get/wall.getComments.",
+                "VK_USER_ACCESS_TOKEN в .env/окружении имеет приоритет над SQLite; "
+                "после изменения .env перезапустите бот.",
                 "Из ссылки group-240114551 используйте VK_GROUP_ID=240114551.",
             ]
         )

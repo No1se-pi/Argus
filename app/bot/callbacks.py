@@ -68,7 +68,10 @@ router = Router(name="callbacks")
 
 
 @router.callback_query(F.data == "menu:main")
-async def main_menu_callback(query: CallbackQuery, module_registry: ModuleRegistry) -> None:
+async def main_menu_callback(
+    query: CallbackQuery, module_registry: ModuleRegistry, state: FSMContext
+) -> None:
+    await state.clear()
     await _edit(query, await main_menu_text(module_registry), main_menu_keyboard())
 
 

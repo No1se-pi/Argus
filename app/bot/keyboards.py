@@ -4,6 +4,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="❤️ Лайки и презентации ВК", callback_data="vkl:menu")],
             [
                 InlineKeyboardButton(text="📊 Дашборды", callback_data="menu:dash"),
                 InlineKeyboardButton(text="🔔 Алерты", callback_data="menu:alerts"),
@@ -52,12 +53,14 @@ def vk_menu_keyboard(available: bool) -> InlineKeyboardMarkup:
     if not available:
         return InlineKeyboardMarkup(
             inline_keyboard=[
+                [InlineKeyboardButton(text="❤️ Лайки по профилям", callback_data="vkl:menu")],
                 [InlineKeyboardButton(text="⚙️ Настроить VK", callback_data="setup:vk")],
                 [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
             ]
         )
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="❤️ Лайки по профилям", callback_data="vkl:menu")],
             [
                 InlineKeyboardButton(text="🩺 VK статус", callback_data="vk:status"),
                 InlineKeyboardButton(text="⚙️ VK настройка", callback_data="setup:vk"),

@@ -9,6 +9,7 @@ except ImportError:
     UTC = timezone.utc  # noqa: UP017
 
 from app.alerts.service import AlertService
+from app.alerts.timing import is_live
 from app.config import Settings
 from app.reviews.client_2gis import DGisReviewsClient
 from app.reviews.client_yandex import YandexReviewsClient
@@ -37,6 +38,7 @@ class ReviewsService:
         alerts: AlertService,
         yandex_client: YandexReviewsClient | None = None,
         dgis_client: DGisReviewsClient | None = None,
+        notify_since: datetime | None = None,
     ) -> None:
         self.settings = settings
         self.runtime_settings = runtime_settings
@@ -46,6 +48,7 @@ class ReviewsService:
         self._dgis_client = dgis_client
         self._sync_lock = asyncio.Lock()
         self._default_sources_seeded = False
+        self.notify_since = notify_since
 
     def _get_yandex_client(self) -> YandexReviewsClient:
         if self._yandex_client is None:
@@ -431,6 +434,15 @@ class ReviewsService:
         # Sort new reviews chronologically: OLDEST to NEWEST
         new_items.sort(key=lambda r: r.published_at)
 
+        if self.notify_since is not None:
+            historical = [item for item in new_items
+                          if not is_live(item.published_at, self.notify_since)]
+            if historical:
+                await self.repository.save_reviews(historical, source.id, mark_sent=True)
+                logger.info("Reviews startup baseline source_id=%s historical=%s (0 alerts)",
+                            source.id, len(historical))
+            new_items = [item for item in new_items if is_live(item.published_at, self.notify_since)]
+
         if new_items:
             await self.repository.save_reviews(new_items, source.id, mark_sent=False)
             status = ReviewSyncStatus.SUCCESS_NEW_REVIEWS
@@ -473,6 +485,13 @@ class ReviewsService:
         unsent = await self.repository.get_unsent_reviews(limit=50)
         sent_count = 0
         for review in unsent:
+            if self.notify_since is not None and not is_live(review.published_at, self.notify_since):
+                # Same silent-baseline convention as initial historical imports.
+                await self.repository.update_delivery_progress(
+                    review.id, parts_sent=review.telegram_parts_total,
+                    parts_total=review.telegram_parts_total, is_sent=True,
+                )
+                continue
             source = (
                 await self.repository.get_source_by_id(review.source_id)
                 if getattr(review, "source_id", None)

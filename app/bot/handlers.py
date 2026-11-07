@@ -71,6 +71,10 @@ VK:
 /vk_recent_comments
 /vk_sync
 /vk_dashboard &lt;period&gt;
+/vk_likes — лайки по профилям за период
+/vk_likes_report — последний сохраненный отчет
+/vk_likes_pptx &lt;period&gt; — заполнить приложенный PPTX
+/vk_likes_bind &lt;VK_ID&gt; | &lt;ФИО&gt; — уточнить профиль
 /vk_watch_on
 /vk_watch_off
 
@@ -106,7 +110,8 @@ Legacy Telegram commands still work when Telegram Monitor is available:
 
 @router.message(CommandStart())
 @router.message(Command("menu"))
-async def start(message: Message, module_registry: ModuleRegistry) -> None:
+async def start(message: Message, module_registry: ModuleRegistry, state: FSMContext) -> None:
+    await state.clear()
     await message.answer(
         await main_menu_text(module_registry),
         reply_markup=main_menu_keyboard(),
