@@ -1022,7 +1022,12 @@ async def _initialize_source_baseline(
 
 
 async def _edit(query: CallbackQuery, text: str, reply_markup=None) -> None:
-    await query.answer()
+    try:
+        await query.answer()
+    except TelegramBadRequest as exc:
+        message = str(exc).lower()
+        if "query is too old" not in message and "query id is invalid" not in message:
+            raise
     if query.message is None:
         return
     try:

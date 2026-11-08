@@ -32,6 +32,22 @@ async def test_llm_status_button_displays_model_and_queue(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_expired_callback_ack_does_not_prevent_screen_update():
+    from unittest.mock import AsyncMock
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import AnswerCallbackQuery
+    from app.bot.callbacks import _edit
+
+    message = SimpleNamespace(edit_text=AsyncMock())
+    query = SimpleNamespace(message=message, answer=AsyncMock(side_effect=TelegramBadRequest(
+        method=AnswerCallbackQuery(callback_query_id="expired"),
+        message="Bad Request: query is too old and response timeout expired or query ID is invalid",
+    )))
+    await _edit(query, "Updated screen")
+    message.edit_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_history_button_finishes_without_llm_status_variables(monkeypatch):
     from unittest.mock import AsyncMock
     import app.bot.callbacks as callbacks
