@@ -4,6 +4,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 def likes_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📑 Полная презентация", callback_data="activity:menu")],
             [
                 InlineKeyboardButton(text="📊 Собрать лайки", callback_data="vklui:period:table"),
                 InlineKeyboardButton(text="📽 Создать PPTX", callback_data="vklui:period:pptx"),

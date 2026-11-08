@@ -14,6 +14,35 @@ from app.storage.schema import init_schema
 
 
 @pytest.mark.asyncio
+async def test_historical_charts_do_not_require_daily_digest_cache(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from app.services.llm.classifier import Classification
+
+    db = Database(tmp_path / "charts.sqlite3")
+    await db.connect()
+    try:
+        await init_schema(db)
+        repos = RepositoryBundle(db)
+        source = await repos.sources.upsert_telegram_source(
+            link="@history", username="history", title="History", entity_id=123,
+            access_hash=456, entity_type="channel",
+        )
+        message_id, _ = await repos.telegram_monitoring.save_message(
+            source_id=source.id, telegram_message_id=1, reply_to_message_id=None,
+            text="Historical", message_date=(datetime.now(timezone.utc)-timedelta(days=2)).isoformat(),
+            message_url=None, prefilter_priority=0, alert_eligible=False,
+        )
+        await repos.telegram_monitoring.save_analysis(message_id,
+            Classification(False,0,.9,[],"positive","other","Test","none"),"test","v1")
+        rows = await repos.telegram_monitoring.chart_rows(30)
+        assert sum(row["messages_count"] for row in rows) == 1
+        assert sum(row["positive_count"] for row in rows) == 1
+        assert not await repos.telegram_monitoring.list_risk_alerts(days=30)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_llm_status_button_displays_model_and_queue(monkeypatch):
     from unittest.mock import AsyncMock
     import app.bot.callbacks as callbacks

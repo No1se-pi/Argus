@@ -216,8 +216,8 @@ class ReviewsService:
             status, items, err, http_code = await client.fetch_reviews(
                 source, page=1, page_size=config.fetch_page_size
             )
-            branch_rating = None
-            total_count = None
+            branch_rating = getattr(client, "last_rating", None)
+            total_count = getattr(client, "last_total_count", None)
         elif source.platform == ReviewPlatform.DGIS:
             d_client = self._get_dgis_client()
             (
@@ -245,6 +245,8 @@ class ReviewsService:
             )
 
         # Handle successful fetch: send recovery alert if coming from degraded state
+        if branch_rating is not None:
+            await self.repository.save_rating_snapshot(source.id, branch_rating, total_count, now_iso)
         health_alert_active = source.health_alert_active
         if source.health_alert_active == 1:
             logger.info(

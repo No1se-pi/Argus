@@ -33,6 +33,7 @@ class DGisReviewsClient:
         self._api_key = api_key
         self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._proxy = proxy
+        self._page_cursors: dict[tuple[str, int, int], str | None] = {}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -41,6 +42,9 @@ class DGisReviewsClient:
                 headers={"User-Agent": self._user_agent},
             )
         return self._session
+
+    def has_next_page(self, source: ReviewSource, page_size: int, page: int) -> bool:
+        return self._page_cursors.get((source.external_id, page_size, page+1)) is not None
 
     async def close(self) -> None:
         if not self._external_session and self._session is not None and not self._session.closed:
@@ -78,16 +82,23 @@ class DGisReviewsClient:
     ]:
         session = await self._get_session()
         api_base = f"https://public-api.reviews.2gis.com/3.0/branches/{source.external_id}/reviews"
+        cursor_key = (source.external_id, page_size, page)
+        if page > 1 and cursor_key not in self._page_cursors:
+            return (ReviewSyncStatus.PARSER_FORMAT_CHANGED, [],
+                    "2GIS pagination requires the preceding page", None, None, None)
+        if page > 1 and self._page_cursors[cursor_key] is None:
+            return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, None, None
 
         for attempt in range(2):
             params = {
                 "limit": str(page_size),
-                "page": str(page),
                 "sort_by": "date_created",
                 "key": self._api_key,
                 "locale": "ru_RU",
                 "fields": "meta.branch_rating,meta.branch_reviews_count,meta.total_count",
             }
+            if page > 1:
+                params["offset_date"] = self._page_cursors[cursor_key]
             url = f"{api_base}?{urllib.parse.urlencode(params)}"
 
             try:
@@ -151,6 +162,13 @@ class DGisReviewsClient:
                         )
                     reviews_data = data["reviews"]
                     meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
+                    next_link = meta.get("next_link")
+                    cursor = None
+                    if isinstance(next_link, str):
+                        parsed = urllib.parse.urlsplit(next_link)
+                        if parsed.netloc == "public-api.reviews.2gis.com" and parsed.path == urllib.parse.urlsplit(api_base).path:
+                            cursor = urllib.parse.parse_qs(parsed.query).get("offset_date", [None])[0]
+                    self._page_cursors[(source.external_id, page_size, page+1)] = cursor
                     branch_rating = (
                         float(meta["branch_rating"])
                         if meta.get("branch_rating") is not None

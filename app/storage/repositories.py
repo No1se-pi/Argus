@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 
 try:
     from datetime import UTC
@@ -10,6 +10,7 @@ except ImportError:
 from app.analytics.dashboard import DashboardService
 from app.reviews.models import ReviewItem, ReviewPlatform, ReviewSource
 from app.storage.database import Database
+from app.time import resolve_timezone
 from app.storage.models import (
     Comment,
     Post,
@@ -1005,15 +1006,30 @@ class TelegramMonitoringRepository:
         await connection.commit()
         return result
 
-    async def chart_rows(self, days: int = 30) -> list[dict]:
+    async def chart_rows(self, days: int = 30, timezone_name: str = "Europe/Moscow") -> list[dict]:
         connection = self.database.require_connection()
+        zone = resolve_timezone(timezone_name)
+        first = datetime.combine(datetime.now(zone).date() - timedelta(days=max(1,days)-1), time.min, zone)
         async with connection.execute(
-            """SELECT d.*, s.title FROM telegram_daily_stats d
-               JOIN sources s ON s.id=d.source_id
-               WHERE d.date >= date('now', ?) ORDER BY d.date, s.title""",
-            (f"-{max(1, days)} days",),
+            """SELECT m.message_date,m.source_id,s.title,a.sentiment,a.severity
+               FROM telegram_messages m JOIN sources s ON s.id=m.source_id
+               LEFT JOIN telegram_message_analysis a ON a.message_id=m.id
+               WHERE julianday(m.message_date)>=julianday(?) ORDER BY m.message_date""",
+            (first.astimezone(UTC).isoformat(),),
         ) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+            grouped = {}
+            async for row in cursor:
+                date = datetime.fromisoformat(row["message_date"].replace("Z", "+00:00")).astimezone(zone).date().isoformat()
+                key = (date,row["source_id"])
+                bucket = grouped.setdefault(key, {"date":date,"source_id":row["source_id"],"title":row["title"],
+                    "messages_count":0,"positive_count":0,"neutral_count":0,"negative_count":0,
+                    "severity_1_count":0,"severity_2_count":0,"severity_3_count":0})
+                bucket["messages_count"] += 1
+                if row["sentiment"] in {"positive","neutral","negative"}:
+                    bucket[row["sentiment"]+"_count"] += 1
+                if row["severity"] in {1,2,3}:
+                    bucket[f"severity_{row['severity']}_count"] += 1
+            return [grouped[key] for key in sorted(grouped)]
 
     async def list_risk_alerts(
         self, *, days: int = 7, severity: int | None = None, limit: int = 20
@@ -1674,6 +1690,18 @@ class ReviewRepository:
         ) as cursor:
             row = await cursor.fetchone()
         return row is not None
+
+    async def save_rating_snapshot(self, source_id: int, rating: float,
+                                   total_count: int | None, captured_at: str) -> None:
+        if not 0 <= rating <= 5:
+            return
+        connection = self.database.require_connection()
+        await connection.execute(
+            """INSERT OR IGNORE INTO review_rating_snapshots
+               (source_id,captured_at,rating,total_reviews_count) VALUES(?,?,?,?)""",
+            (source_id,captured_at,rating,total_count),
+        )
+        await connection.commit()
 
     async def save_reviews(
         self,

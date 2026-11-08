@@ -152,13 +152,14 @@ def monitoring_alerts_keyboard(days: int = 7, severity: int | None = None) -> In
 def monitoring_stats_keyboard(days: int = 1) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📚 Вся загруженная история", callback_data="tgm:stats:0:all")],
             [
                 InlineKeyboardButton(text="Сегодня", callback_data="tgm:stats:1:all"),
                 InlineKeyboardButton(text="7 дней", callback_data="tgm:stats:7:all"),
                 InlineKeyboardButton(text="30 дней", callback_data="tgm:stats:30:all"),
             ],
             [
-                InlineKeyboardButton(text="🚨 Алерты", callback_data=f"tgm:alerts:{days}:all"),
+                InlineKeyboardButton(text="🚨 Алерты" if days else "🚨 Алерты за 30 дней", callback_data=f"tgm:alerts:{days or 30}:all"),
                 InlineKeyboardButton(text="📈 Графики", callback_data="tgm:charts"),
             ],
             [InlineKeyboardButton(text="⏪ Загрузить последние 50", callback_data="tgm:backfill:50")],
@@ -345,6 +346,7 @@ def reviews_menu_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     toggle_action = "reviews:off" if enabled else "reviews:on"
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📑 Полная презентация", callback_data="activity:menu")],
             [
                 InlineKeyboardButton(text="🔄 Проверить сейчас", callback_data="reviews:sync"),
                 InlineKeyboardButton(text="📋 Филиалы (12)", callback_data="reviews:sources"),

@@ -3,6 +3,8 @@ import http.cookiejar
 import json
 import logging
 import re
+import math
+from time import monotonic
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -55,6 +57,10 @@ class YandexReviewsClient:
         self._session_id: str | None = None
         self._locale: str = "ru_RU"
         self._base_origin: str = "https://yandex.ru"
+        self._metadata_business_id: str | None = None
+        self._metadata_at = 0.0
+        self.last_rating: float | None = None
+        self.last_total_count: int | None = None
 
     async def close(self) -> None:
         pass
@@ -72,6 +78,7 @@ class YandexReviewsClient:
         source: ReviewSource,
     ) -> tuple[ReviewSyncStatus, str | None, int | None]:
         opener = self._create_opener()
+        self.last_rating = self.last_total_count = None
         try:
             page_req = urllib.request.Request(
                 source.url,
@@ -104,6 +111,12 @@ class YandexReviewsClient:
                 )
 
             page_data = json.loads(scripts[0])
+            self._read_rating(page_data, source.external_id)
+            for structured in re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.DOTALL):
+                try:
+                    self._read_rating(json.loads(structured), source.external_id)
+                except (ValueError,TypeError):
+                    continue
             cfg = page_data.get("config", {}) if isinstance(page_data, dict) else {}
             self._csrf_token = cfg.get("csrfToken") if isinstance(cfg, dict) else None
             counters = (
@@ -120,6 +133,9 @@ class YandexReviewsClient:
             if not self._csrf_token or not self._session_id:
                 return ReviewSyncStatus.PARSER_FORMAT_CHANGED, "Missing csrfToken or sessionId", 200
 
+            self._metadata_business_id = source.external_id
+            self._metadata_at = monotonic()
+
             return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, None, 200
 
         except urllib.error.HTTPError as exc:
@@ -133,6 +149,30 @@ class YandexReviewsClient:
         except Exception as exc:
             return ReviewSyncStatus.UNKNOWN_ERROR, f"Unexpected error: {exc}", None
 
+    def _read_rating(self, node, business_id: str) -> None:
+        if isinstance(node, list):
+            for item in node:
+                self._read_rating(item, business_id)
+        elif isinstance(node, dict):
+            candidate = None
+            if any(str(node.get(key,"")) == business_id for key in ("id","oid","businessId")):
+                candidate = node.get("ratingData") or node.get("aggregateRating")
+            elif (isinstance(node.get("@type"),str) and node.get("@type") in {"Organization","LocalBusiness","CollegeOrUniversity","EducationalOrganization"}
+                  and business_id in str(node.get("url", ""))+str(node.get("@id", ""))):
+                candidate = node.get("aggregateRating")
+            if isinstance(candidate, dict):
+                try:
+                    value = float(candidate.get("ratingValue"))
+                    if math.isfinite(value) and 1 <= value <= 5:
+                        self.last_rating = value
+                        count = candidate.get("reviewCount")
+                        self.last_total_count = int(count) if count is not None else None
+                except (ValueError,TypeError,OverflowError):
+                    pass
+            for value in node.values():
+                if isinstance(value,(dict,list)):
+                    self._read_rating(value,business_id)
+
     def _sync_fetch(
         self,
         source: ReviewSource,
@@ -140,7 +180,10 @@ class YandexReviewsClient:
         page_size: int = 10,
     ) -> tuple[ReviewSyncStatus, list[ReviewItem], str | None, int | None]:
         # Step 1: Initialize session credentials if needed
-        if not self._csrf_token or not self._session_id or self._opener is None:
+        if (not self._csrf_token or not self._session_id or self._opener is None
+                or (self._metadata_business_id is not None and
+                    (self._metadata_business_id != source.external_id or
+                     (page == 1 and monotonic()-self._metadata_at > 300)))):
             init_status, err, http_code = self._initialize_session(source)
             if init_status != ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS:
                 return init_status, [], err, http_code
@@ -270,6 +313,7 @@ class YandexReviewsClient:
                                 text=text,
                                 published_at=published_at,
                                 edited_at=None,
+                                raw_payload_json=json.dumps(r, ensure_ascii=False),
                                 review_url=rev_url,
                             )
                         )

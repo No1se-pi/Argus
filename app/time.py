@@ -1,10 +1,18 @@
 import logging
+import re
 from datetime import datetime, time, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
 MOSCOW = timezone(timedelta(hours=3), name="Europe/Moscow")
+
+
+def parse_iso_datetime(value: str) -> datetime:
+    """Python 3.10 also accepts API timestamps with 1/2/4/5 fractional digits."""
+    normalized = value.strip().replace("Z", "+00:00")
+    normalized = re.sub(r"\.(\d+)", lambda match: "." + match[1][:6].ljust(6, "0"), normalized)
+    return datetime.fromisoformat(normalized)
 
 
 def resolve_timezone(name: str) -> tzinfo:

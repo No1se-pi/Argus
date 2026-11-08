@@ -24,6 +24,7 @@ from app.services.daily_digest import DailyDigestScheduler, DailyDigestService
 from app.services.llm.classifier import MessageClassifier
 from app.services.llm.ollama_client import OllamaClient
 from app.services.llm.reviews import ReviewClassifier
+from app.reports.service import ActivityReportService
 from app.services.telegram_monitoring import AnalysisWorker, TelegramRealtimeMonitor
 from app.storage.database import Database
 from app.storage.repositories import RepositoryBundle
@@ -92,6 +93,7 @@ async def main() -> None:
     vk_likes_service = VKLikesService(vk_service, VKLikesRepository(database))
     vk_likes_workspace = VKLikesWorkspace(vk_likes_service)
     await vk_likes_workspace.seed_bindings()
+    activity_report_service = ActivityReportService(database, vk_likes_workspace, settings.timezone, reviews_service)
     reviews_scheduler = ReviewsPollingScheduler(
         settings=settings,
         service=reviews_service,
@@ -122,6 +124,7 @@ async def main() -> None:
         runtime_settings_repo=repositories.runtime_settings,
         vk_likes_service=vk_likes_service,
         vk_likes_workspace=vk_likes_workspace,
+        activity_report_service=activity_report_service,
         telegram_auth_service=telegram_auth_service,
         keyword_repo=repositories.keywords,
         access_service=access_service,

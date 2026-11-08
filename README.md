@@ -639,3 +639,15 @@ Never commit:
 - logs
 
 Argus masks secrets in UI summaries and does not log token values intentionally.
+
+## Full activity presentation (`dev`)
+
+Open **Полная презентация** in the VK/reviews menu, or use
+`/activity_pptx 12.10.2026 19.10.2026`. The bot prepares the supplied template with
+review cards, department summaries, available rating snapshots, VK likes and
+confirmed critical cases. It returns the PPTX and a separate audit archive.
+
+Install the optional renderer with `pip install -e ".[reports]"` and
+`python -m playwright install chromium`. See
+[activity report documentation](docs/activity-reports.md) for data coverage,
+pagination, identity suggestions, limits and deployment requirements.

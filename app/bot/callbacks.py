@@ -274,12 +274,14 @@ async def monitoring_stats_callback(
     except (IndexError, ValueError):
         await query.answer("Некорректный период", show_alert=True)
         return
-    if days not in {1, 7, 30}:
+    if days not in {0, 1, 7, 30}:
         await query.answer("Некорректный период", show_alert=True)
         return
     start_iso, end_iso = period_utc_bounds(settings.timezone, days)
+    if days == 0:
+        start_iso = "1970-01-01T00:00:00+00:00"
     stats = await telegram_monitoring_repo.monitoring_summary(start_iso, end_iso, source_id)
-    period_name = "сегодня" if days == 1 else f"{days} дней"
+    period_name = "вся загруженная история" if days == 0 else ("сегодня" if days == 1 else f"{days} дней")
     lines = [
         f"🔭 <b>Telegram Analytics — {period_name}</b>",
         "",
@@ -287,6 +289,7 @@ async def monitoring_stats_callback(
         f"Проанализировано: <b>{stats['analyzed']}</b>",
         f"Очередь: <b>{stats['pending']}</b> · отложено: <b>{stats['deferred']}</b>",
         f"Ошибки анализа: <b>{stats['errors']}</b>",
+        "Период считается по дате сообщения, а не по дате загрузки истории.",
         "",
         "<b>Настроение:</b>",
         f"🟢 positive: {stats['positive']}",
@@ -366,7 +369,7 @@ async def monitoring_backfill_callback(
         f"Добавлено в анализ: <b>{saved}</b>\n"
         f"Ошибок источников: <b>{failed}</b>\n\n"
         "Исторические сообщения попадут в статистику, но не создадут старые алерты.",
-        monitoring_stats_keyboard(1),
+        monitoring_stats_keyboard(0),
     )
 
 
@@ -472,10 +475,7 @@ async def monitoring_charts_callback(
     telegram_monitoring_repo: TelegramMonitoringRepository,
     settings: Settings,
 ) -> None:
-    today = local_date_iso(settings.timezone)
-    for source in await source_repo.list_sources():
-        await telegram_monitoring_repo.aggregate_day(today, source.id)
-    rows = await telegram_monitoring_repo.chart_rows(30)
+    rows = await telegram_monitoring_repo.chart_rows(30, settings.timezone)
     await query.answer()
     if query.message is None:
         return

@@ -20,6 +20,7 @@ include = ["app*"]
 
 [project.optional-dependencies]
 vk-auth = ["playwright>=1.50,<2"]
+reports = ["playwright>=1.50,<2"]
 proxy = ["aiohttp-socks>=0.9,<1"]
 
 [tool.setuptools.package-data]
@@ -27,7 +28,7 @@ proxy = ["aiohttp-socks>=0.9,<1"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

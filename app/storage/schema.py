@@ -340,6 +340,20 @@ CREATE TABLE IF NOT EXISTS review_analysis (
     last_error TEXT,
     next_retry_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS review_rating_snapshots (
+    source_id INTEGER NOT NULL REFERENCES review_sources(id) ON DELETE CASCADE,
+    captured_at TEXT NOT NULL,
+    rating REAL NOT NULL,
+    total_reviews_count INTEGER,
+    PRIMARY KEY(source_id,captured_at)
+);
+CREATE TABLE IF NOT EXISTS review_history_coverage (
+    source_id INTEGER PRIMARY KEY REFERENCES review_sources(id) ON DELETE CASCADE,
+    period_start TEXT NOT NULL,
+    period_end TEXT NOT NULL,
+    checked_at TEXT NOT NULL
+);
 """
 
 
