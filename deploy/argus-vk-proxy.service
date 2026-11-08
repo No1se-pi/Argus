@@ -1,0 +1,17 @@
+[Unit]
+Description=Direct VK egress for Argus inside botvpn
+Requires=botvpn-network.service
+After=network-online.target botvpn-network.service
+
+[Service]
+User=no1se
+Group=no1se
+RuntimeDirectory=argus-vk-proxy
+ExecStart=/usr/bin/tinyproxy -d -c /srv/services/argus-phone-login-20261108/deploy/argus-tinyproxy.conf
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

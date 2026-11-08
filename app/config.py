@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     vk_user_access_token: SecretStr | None = None
     vk_service_access_token: SecretStr | None = None
     vk_web_access_token: SecretStr | None = None
+    vk_proxy_url: SecretStr | None = None
     vk_auth_public_url: str = ""
     vk_auth_bind_host: str = "127.0.0.1"
     vk_auth_port: int = Field(default=8788, ge=1, le=65535)

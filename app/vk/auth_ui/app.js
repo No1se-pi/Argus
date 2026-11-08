@@ -11,6 +11,7 @@ const labels = {
   cancelled: 'Подключение закрыто. Получить новую ссылку можно в боте.'
 };
 let running = false, busy = false, previousImage;
+let actionQueue = Promise.resolve(), queuedActions = 0;
 async function command(action, fields = {}) {
   const response = await fetch('/vk-connect/action', {
     method: 'POST', credentials: 'same-origin',
@@ -20,6 +21,13 @@ async function command(action, fields = {}) {
   if (!response.ok) throw new Error('Ссылка истекла или действие недоступно. Получите новую ссылку в боте.');
   const data = await response.json();
   el('status').textContent = labels[data.status] || 'Подключение…';
+  if (data.status === 'waiting' && data.view === 'loading') {
+    el('status').textContent = 'Загружается страница ВК. Дождитесь появления формы входа.';
+  } else if (data.status === 'waiting' && data.view === 'stalled') {
+    el('status').textContent = 'ВК завис на загрузке. Нажмите «Перезагрузить ВК» или «Открыть форму входа».';
+  } else if (data.status === 'waiting' && data.view === 'challenge') {
+    el('status').textContent = 'ВК просит проверку безопасности. Пройдите её в окне ниже.';
+  }
   el('host').textContent = data.host || '—';
   if (data.status === 'connected') {
     running = false; el('remote').hidden = true; el('success').hidden = false;
@@ -28,16 +36,22 @@ async function command(action, fields = {}) {
   }
   return data;
 }
-async function act(action, fields = {}) {
-  if (busy) return;
-  busy = true;
-  try { return await command(action, fields); }
-  catch (error) { el('status').textContent = error.message; running = false; }
-  finally { busy = false; }
+function act(action, fields = {}) {
+  queuedActions++;
+  const execute = async () => {
+    while (busy) await new Promise(resolve => setTimeout(resolve, 25));
+    busy = true;
+    try { return await command(action, fields); }
+    catch (error) { el('status').textContent = error.message; running = false; }
+    finally { busy = false; queuedActions--; }
+  };
+  const result = actionQueue.then(execute);
+  actionQueue = result.catch(() => {});
+  return result;
 }
 async function update() {
   if (!running) return;
-  if (!busy) {
+  if (!busy && queuedActions === 0) {
     busy = true;
     try {
       await command('status');
@@ -50,6 +64,7 @@ async function update() {
           el('screen').src = image;
           if (previousImage) URL.revokeObjectURL(previousImage);
           previousImage = image;
+          el('frame-state').textContent = 'Изображение обновлено: ' + new Date().toLocaleTimeString('ru-RU');
         }
       }
     } catch (error) { el('status').textContent = error.message; running = false; }
@@ -71,7 +86,6 @@ el('screen').addEventListener('click', event => {
 });
 el('typing').addEventListener('submit', async event => {
   event.preventDefault();
-  if (busy) return;
   const text = el('text').value; el('text').value = '';
   if (text) await act('type', {text});
 });
@@ -81,5 +95,7 @@ for (const [id, key] of [['enter', 'Enter'], ['tab', 'Tab'], ['backspace', 'Back
 el('up').addEventListener('click', () => act('scroll', {down: false}));
 el('down').addEventListener('click', () => act('scroll', {down: true}));
 el('community').addEventListener('click', () => act('community'));
+el('reload').addEventListener('click', () => act('reload'));
+el('login').addEventListener('click', () => act('login'));
 el('cancel').addEventListener('click', () => act('cancel'));
 if (!secret) { el('open').disabled = true; el('status').textContent = 'Откройте персональную ссылку из бота.'; }

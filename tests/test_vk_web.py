@@ -16,7 +16,8 @@ def test_web_token_has_priority_over_other_keys():
 
 
 @pytest.mark.asyncio
-async def test_web_transport_posts_credentials_in_body_without_cookies(monkeypatch):
+@pytest.mark.parametrize("proxy", [None, "http://10.254.42.1:8790"])
+async def test_web_transport_posts_credentials_in_body_without_cookies(monkeypatch, proxy):
     captured = {}
 
     class Response:
@@ -44,7 +45,9 @@ async def test_web_transport_posts_credentials_in_body_without_cookies(monkeypat
             return Response()
 
     monkeypatch.setattr("app.vk.client.aiohttp.ClientSession", Session)
-    client = VKClient(access_token="test-web-secret", api_version="5.199", web_mode=True)
+    client = VKClient(
+        access_token="test-web-secret", api_version="5.199", web_mode=True, proxy=proxy
+    )
     result = await client.get_likes_page(173208026, 7731, offset=50)
     assert result == {"count": 1, "items": [42]}
     assert captured["url"] == "https://web.api.vk.ru/method/likes.getList"
@@ -55,3 +58,4 @@ async def test_web_transport_posts_credentials_in_body_without_cookies(monkeypat
     assert captured["data"]["extended"] == 0
     assert captured["params"] == {"v": "5.289", "client_id": "6287487"}
     assert "Cookie" not in captured["headers"]
+    assert captured["proxy"] == proxy

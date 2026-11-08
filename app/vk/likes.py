@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from app.analytics.periods import parse_period
 from app.time import resolve_timezone
-from app.vk.client import VKAPIError, VKClient
+from app.vk.client import VKAPIError, VKClient, configured_vk_proxy
 from app.vk.likes_repository import VKLikesRepository
 from app.vk.service import VKService
 
@@ -135,6 +135,7 @@ class VKLikesService:
                 access_token=token,
                 api_version=self.vk_service.settings.vk_api_version,
                 web_mode=bool(likes_web_token(self.vk_service.settings, config)),
+                proxy=configured_vk_proxy(self.vk_service.settings),
             )
             started = datetime.now(UTC).isoformat()
             group_id = config.group_id

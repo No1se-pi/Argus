@@ -8,11 +8,11 @@ import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from aiohttp import web
 
-from app.vk.client import VKClient
+from app.vk.client import VKClient, configured_vk_proxy
 
 logger = logging.getLogger(__name__)
 ASSETS = Path(__file__).parent / "auth_ui"
@@ -22,6 +22,19 @@ COOKIE = "argus_vk_login"
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def browser_proxy(url: str | None) -> dict | None:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("VK_PROXY_URL must be an HTTP(S) proxy")
+    value = {"server": f"{parsed.scheme}://{parsed.netloc.rsplit('@', 1)[-1]}"}
+    if parsed.username is not None:
+        value["username"] = unquote(parsed.username)
+        value["password"] = unquote(parsed.password or "")
+    return value
 
 
 def website_token(request) -> str | None:
@@ -78,6 +91,7 @@ class VKAuthHelper:
         self.lock = asyncio.Lock()
         self.candidates = asyncio.Queue(maxsize=1)
         self.seen = set()
+        self.page_opened_at = None
         self.app = web.Application(client_max_size=8192, middlewares=[self.headers])
         self.app.router.add_get("/vk-connect", self.index)
         self.app.router.add_get("/vk-connect/app.js", self.asset)
@@ -207,14 +221,16 @@ class VKAuthHelper:
             viewport={"width": 1000, "height": 760},
             locale="ru-RU",
             accept_downloads=False,
+            proxy=browser_proxy(configured_vk_proxy(self.workspace.service.vk_service.settings)),
         )
         self.context.on("request", self.observe)
         self.context.on("page", self.new_page)
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         self.capture_task = asyncio.create_task(self.capture(), name="vk-login-capture")
         self.status = "waiting"
+        self.page_opened_at = time.monotonic()
         await self.page.goto(
-            f"https://vk.ru/club{self.ticket.group_id}",
+            "https://vk.ru/login",
             wait_until="domcontentloaded",
             timeout=45000,
         )
@@ -229,7 +245,12 @@ class VKAuthHelper:
             self.candidates.put_nowait(token)
 
     async def verify(self, token):
-        client = VKClient(access_token=token, api_version="5.289", web_mode=True)
+        client = VKClient(
+            access_token=token,
+            api_version="5.289",
+            web_mode=True,
+            proxy=configured_vk_proxy(self.workspace.service.vk_service.settings),
+        )
         group = self.ticket.group_id
         wall = await client.request("wall.get", {"owner_id": -group, "count": 1})
         posts = wall.get("items", []) if isinstance(wall, dict) else []
@@ -281,6 +302,20 @@ class VKAuthHelper:
             image = await self.page.screenshot(type="jpeg", quality=70, timeout=10000)
             return web.Response(body=image, content_type="image/jpeg")
 
+    async def page_view(self) -> str:
+        try:
+            text = await self.page.locator("body").inner_text(timeout=1500)
+            text = text.replace("\u200c", "").replace("\u200b", "").strip()
+            if len(text) < 30:
+                age = time.monotonic() - (self.page_opened_at or time.monotonic())
+                return "stalled" if age > 20 else "loading"
+            title = (await self.page.title()).lower()
+            if "не робот" in title or "captcha" in title:
+                return "challenge"
+            return "interactive"
+        except Exception:
+            return "loading"
+
     async def action(self, request):
         data = await request.json()
         if not isinstance(data, dict):
@@ -321,16 +356,28 @@ class VKAuthHelper:
                 elif action == "scroll":
                     await self.page.mouse.wheel(0, 500 if data.get("down", True) else -500)
                 elif action == "community":
+                    self.page_opened_at = time.monotonic()
                     await self.page.goto(
                         f"https://vk.ru/club{self.ticket.group_id}",
                         wait_until="domcontentloaded",
                         timeout=45000,
                     )
+                elif action == "login":
+                    self.page_opened_at = time.monotonic()
+                    await self.page.goto(
+                        "https://vk.ru/login", wait_until="domcontentloaded", timeout=45000
+                    )
+                elif action == "reload":
+                    self.page_opened_at = time.monotonic()
+                    await self.page.reload(wait_until="domcontentloaded", timeout=45000)
                 else:
                     raise web.HTTPBadRequest()
             # Never expose query strings/fragments, credentials, cookies or browser exceptions.
             host = urlparse(self.page.url).hostname if self.page else ""
-            response = web.json_response({"status": self.status, "host": host})
+            result = {"status": self.status, "host": host}
+            if self.page and self.page_opened_at is not None:
+                result["view"] = await self.page_view()
+            response = web.json_response(result)
             if new_cookie:
                 response.set_cookie(
                     COOKIE,

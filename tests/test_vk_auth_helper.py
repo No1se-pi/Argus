@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from app.vk.auth_helper import VKAuthHelper, website_token
+from app.vk.auth_helper import VKAuthHelper, browser_proxy, website_token
 from app.vk.likes import likes_access_token, likes_web_token
 
 
@@ -168,3 +168,44 @@ def test_new_runtime_web_token_overrides_stale_environment_without_restart():
 def test_helper_requires_https_origin(url):
     with pytest.raises(ValueError):
         VKAuthHelper(public_url=url, port=8788, workspace=None)
+
+
+def test_browser_and_api_use_explicit_vk_proxy_without_leaking_credentials():
+    from pydantic import SecretStr
+
+    from app.vk.client import configured_vk_proxy
+
+    url = "http://user:pass%21@10.254.42.1:8790"
+    settings = SimpleNamespace(vk_proxy_url=SecretStr(url), bot_proxy_url=SecretStr("http://other"))
+    assert configured_vk_proxy(settings) == url
+    assert browser_proxy(configured_vk_proxy(settings)) == {
+        "server": "http://10.254.42.1:8790",
+        "username": "user",
+        "password": "pass!",
+    }
+    assert browser_proxy(None) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text,age,title,expected",
+    [
+        ("\u200c " * 10, 1, "ВКонтакте", "loading"),
+        ("\u200c " * 10, 35, "ВКонтакте", "stalled"),
+        ("Форма входа с номером телефона и подтверждением", 35, "Вход", "interactive"),
+        (
+            "Пройдите проверку безопасности для продолжения",
+            35,
+            "Проверяем, что вы не робот",
+            "challenge",
+        ),
+    ],
+)
+async def test_loading_state_does_not_claim_login_is_ready(login, text, age, title, expected):
+    helper, _, _ = login
+    helper.page_opened_at = time.monotonic() - age
+    helper.page = SimpleNamespace(
+        locator=lambda _: SimpleNamespace(inner_text=AsyncMock(return_value=text)),
+        title=AsyncMock(return_value=title),
+    )
+    assert await helper.page_view() == expected

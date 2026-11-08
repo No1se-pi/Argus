@@ -6,6 +6,11 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 
+def configured_vk_proxy(settings) -> str | None:
+    value = getattr(settings, "vk_proxy_url", None)
+    return value.get_secret_value() if value else None
+
+
 class VKAPIError(Exception):
     """Raised when VK API returns an error response."""
 
@@ -69,10 +74,18 @@ def vk_error_text(error: VKAPIError) -> str:
 class VKClient:
     BASE_URL = "https://api.vk.com/method"
 
-    def __init__(self, *, access_token: str, api_version: str, web_mode: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        access_token: str,
+        api_version: str,
+        web_mode: bool = False,
+        proxy: str | None = None,
+    ) -> None:
         self.access_token = access_token
         self.api_version = "5.289" if web_mode else api_version
         self.web_mode = web_mode
+        self.proxy = proxy
 
     async def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
         payload = dict(params or {})
@@ -87,9 +100,12 @@ class VKClient:
                     data=payload,
                     headers={"Origin": "https://vk.ru", "Referer": "https://vk.ru/"},
                     timeout=30,
+                    proxy=self.proxy,
                 )
             else:
-                request = session.get(f"{self.BASE_URL}/{method}", params=payload, timeout=30)
+                request = session.get(
+                    f"{self.BASE_URL}/{method}", params=payload, timeout=30, proxy=self.proxy
+                )
             async with request as response:
                 response.raise_for_status()
                 try:

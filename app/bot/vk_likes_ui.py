@@ -34,7 +34,7 @@ from app.bot.vk_likes_keyboards import (
     period_keyboard,
     template_keyboard,
 )
-from app.vk.client import VKAPIError, VKClient, vk_error_text
+from app.vk.client import VKAPIError, VKClient, configured_vk_proxy, vk_error_text
 from app.vk.likes import likes_access_token, likes_web_token, parse_selection
 from app.vk.presentation import name_tokens
 from app.vk.workspace import VKLikesWorkspace
@@ -118,6 +118,7 @@ async def check_auth(query: CallbackQuery, state: FSMContext, vk_likes_workspace
                 access_token=token,
                 api_version=service.settings.vk_api_version,
                 web_mode=bool(likes_web_token(service.settings, config)),
+                proxy=configured_vk_proxy(service.settings),
             )
             wall = await client.request("wall.get", {"owner_id": -abs(config.group_id), "count": 1})
             text += "✅ Чтение постов: wall.get доступен.\n"
@@ -455,6 +456,7 @@ async def profile_id(reference: str, workspace: VKLikesWorkspace) -> int:
         access_token=token,
         api_version=workspace.service.vk_service.settings.vk_api_version,
         web_mode=bool(likes_web_token(workspace.service.vk_service.settings, config)),
+        proxy=configured_vk_proxy(workspace.service.vk_service.settings),
     )
     users = await client.request("users.get", {"user_ids": name})
     if (
