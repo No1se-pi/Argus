@@ -17,6 +17,24 @@ from app.vk.likes_repository import VKLikesRepository
 GROUP = 173208026
 
 
+@pytest.mark.asyncio
+async def test_collect_can_use_service_key_without_user_token(collection, monkeypatch):
+    from pydantic import SecretStr
+
+    service, client, config = collection
+    config.user_access_token = None
+    service.vk_service.settings.vk_service_access_token = SecretStr("service-key")
+    received = []
+
+    def factory(**kwargs):
+        received.append(kwargs["access_token"])
+        return client
+
+    monkeypatch.setattr("app.vk.likes.VKClient", factory)
+    await service.collect(parse_selection("last 1", "Europe/Moscow"))
+    assert received == ["service-key"]
+
+
 def post(post_id, date="2026-10-15T12:00:00+00:00", **extra):
     return {
         "id": post_id,

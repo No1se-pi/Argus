@@ -18,6 +18,13 @@ dependencies = [
 [tool.setuptools.packages.find]
 include = ["app*"]
 
+[project.optional-dependencies]
+vk-auth = ["playwright>=1.50,<2"]
+proxy = ["aiohttp-socks>=0.9,<1"]
+
+[tool.setuptools.package-data]
+"app.vk" = ["auth_ui/*.html", "auth_ui/*.css", "auth_ui/*.js"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

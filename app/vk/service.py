@@ -27,6 +27,7 @@ class VKEffectiveConfig:
     user_access_token: str | None
     group_id: int | None
     monitor_mode: str
+    web_access_token: str | None = None
 
     @property
     def any_token(self) -> str | None:
@@ -94,6 +95,7 @@ class VKService:
             user_access_token=user_access_token,
             group_id=abs(group_id) if group_id is not None else None,
             monitor_mode=monitor_mode or self.settings.vk_monitor_mode,
+            web_access_token=await self.runtime_settings.get("vk_web_access_token"),
         )
 
     async def module_info(

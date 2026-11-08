@@ -1,0 +1,26 @@
+:root { color-scheme: dark; font-family: system-ui, sans-serif; background: #0b1220; color: #edf3ff; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px 14px; }
+main { max-width: 820px; margin: auto; }
+header { display: flex; gap: 20px; align-items: center; margin-bottom: 30px; }
+.brand { letter-spacing: .2em; font-weight: 800; color: #a9bfff; }
+.tag { font-size: 13px; color: #a8b7d0; }
+h1 { font-size: clamp(26px, 6vw, 38px); line-height: 1.12; }
+p { color: #bac8de; line-height: 1.6; }
+#status { padding: 16px; border: 1px solid #354769; border-radius: 12px; margin: 22px 0; }
+button { border: 1px solid #526382; background: #24334e; color: white; padding: 13px 17px;
+  border-radius: 10px; font: inherit; cursor: pointer; min-height: 46px; }
+button:disabled { opacity: .55; cursor: wait; }
+.primary { background: #426eea; border-color: #426eea; width: 100%; font-weight: 650; }
+.quiet { margin-top: 24px; background: transparent; color: #bac8de; }
+.address { font-size: 13px; padding: 12px 0; overflow-wrap: anywhere; }
+.screen { overflow: auto; border-radius: 10px; background: #fff; min-height: 180px; }
+#screen { display: block; width: 100%; height: auto; cursor: pointer; user-select: none; }
+.hint { font-size: 13px; }
+label { display: block; margin-bottom: 8px; font-size: 14px; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+input { flex: 1; min-width: 140px; border: 1px solid #526382; border-radius: 10px; padding: 13px;
+  background: #142038; color: white; font-size: 16px; }
+.controls button { flex: 1; font-size: 14px; }
+#community { width: 100%; }
+[hidden] { display: none !important; }

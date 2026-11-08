@@ -51,6 +51,14 @@ def vk_error_text(error: VKAPIError) -> str:
     }
     if error.auth_reason:
         return f"VK API: код 5. {reasons[error.auth_reason]}"
+    if str(error.code) == "1051":
+        return (
+            "VK API: код 1051. Метод недоступен для текущего типа токена/профиля. "
+            "Для сбора лайков попробуйте сервисный ключ своего приложения "
+            "в VK_SERVICE_ACCESS_TOKEN и проверьте доступ. Если отказ сохранится, "
+            "уточните доступ к likes.getList у поддержки VK API для вашего приложения. "
+            "Повторный вход с тем же типом токена сам по себе ограничение не снимает."
+        )
     if str(error.code) in {"7", "15", "27"}:
         return "ВК отказал в доступе к методу или объекту. Проверьте тип токена и права доступа."
     if str(error.code) in {"6", "9", "29"}:
@@ -61,9 +69,10 @@ def vk_error_text(error: VKAPIError) -> str:
 class VKClient:
     BASE_URL = "https://api.vk.com/method"
 
-    def __init__(self, *, access_token: str, api_version: str) -> None:
+    def __init__(self, *, access_token: str, api_version: str, web_mode: bool = False) -> None:
         self.access_token = access_token
-        self.api_version = api_version
+        self.api_version = "5.289" if web_mode else api_version
+        self.web_mode = web_mode
 
     async def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
         payload = dict(params or {})
@@ -71,9 +80,17 @@ class VKClient:
         payload["v"] = self.api_version
 
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{self.BASE_URL}/{method}", params=payload, timeout=30
-            ) as response:
+            if self.web_mode:
+                request = session.post(
+                    f"https://web.api.vk.ru/method/{method}",
+                    params={"v": self.api_version, "client_id": "6287487"},
+                    data=payload,
+                    headers={"Origin": "https://vk.ru", "Referer": "https://vk.ru/"},
+                    timeout=30,
+                )
+            else:
+                request = session.get(f"{self.BASE_URL}/{method}", params=payload, timeout=30)
+            async with request as response:
                 response.raise_for_status()
                 try:
                     data = await response.json(content_type=None)

@@ -32,10 +32,16 @@ class Settings(BaseSettings):
     require_telethon: bool = False
 
     bot_token: SecretStr
+    bot_proxy_url: SecretStr | None = None
     admin_ids_text: str = Field(default="", validation_alias="ADMIN_IDS")
 
     vk_group_token: SecretStr | None = None
     vk_user_access_token: SecretStr | None = None
+    vk_service_access_token: SecretStr | None = None
+    vk_web_access_token: SecretStr | None = None
+    vk_auth_public_url: str = ""
+    vk_auth_bind_host: str = "127.0.0.1"
+    vk_auth_port: int = Field(default=8788, ge=1, le=65535)
     vk_access_token: SecretStr | None = None
     vk_group_id: int | None = None
     vk_monitor_mode: str = "longpoll"

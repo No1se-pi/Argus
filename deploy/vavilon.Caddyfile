@@ -1,0 +1,11 @@
+# Replace /etc/caddy/Caddyfile only after checking the existing site configuration.
+# vavilon: Argus runs inside botvpn; 10.254.42.2 is its private veth address.
+kaiton.ru, www.kaiton.ru {
+    handle /vk-connect* {
+        reverse_proxy 10.254.42.2:8788
+    }
+
+    handle {
+        reverse_proxy 127.0.0.1:4000
+    }
+}

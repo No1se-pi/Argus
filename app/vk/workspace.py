@@ -24,6 +24,7 @@ class VKLikesWorkspace:
             Path(service.vk_service.settings.database_path).parent / "vk_likes_template.pptx"
         )
         self._lock = asyncio.Lock()
+        self.auth_helper = None
 
     async def seed_bindings(self) -> None:
         if await self.settings.get("vk_likes_bindings_seed_v1"):

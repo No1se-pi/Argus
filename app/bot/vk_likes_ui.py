@@ -1,5 +1,6 @@
 """Button-based workflows for VK reports, saved templates, and explicit identities."""
 
+import asyncio
 import io
 import json
 import re
@@ -12,7 +13,13 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandObject
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BufferedInputFile, CallbackQuery, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from app.bot.states import VKLikesStates
 from app.bot.vk_likes import (
@@ -28,11 +35,56 @@ from app.bot.vk_likes_keyboards import (
     template_keyboard,
 )
 from app.vk.client import VKAPIError, VKClient, vk_error_text
-from app.vk.likes import parse_selection
+from app.vk.likes import likes_access_token, likes_web_token, parse_selection
 from app.vk.presentation import name_tokens
 from app.vk.workspace import VKLikesWorkspace
 
 router = Router(name="vk_likes_ui")
+
+
+@router.callback_query(F.data == "vklui:connect")
+async def connect_vk(query: CallbackQuery, state: FSMContext, vk_likes_workspace: VKLikesWorkspace):
+    await query.answer()
+    await state.clear()
+    if not isinstance(query.message, Message) or query.message.chat.type != "private":
+        if isinstance(query.message, Message):
+            await query.message.answer("Для подключения ВК откройте личный чат с ботом.")
+        return
+    helper = vk_likes_workspace.auth_helper
+    if helper is None:
+        await show(
+            query,
+            "Помощник входа ещё не размещён. Администратору нужно настроить "
+            "HTTPS-адрес VK_AUTH_PUBLIC_URL на сервере.",
+            likes_keyboard(),
+        )
+        return
+    config = await vk_likes_workspace.service.vk_service.effective_config()
+    if not config.group_id:
+        await show(query, "Сначала укажите сообщество в «Настроить ВК».", likes_keyboard())
+        return
+    try:
+        url = await helper.issue(query.message.chat.id, config.group_id)
+    except ValueError as exc:
+        await show(query, str(exc), likes_keyboard())
+        return
+    await show(
+        query,
+        "<b>🔐 Подключение ВК с телефона</b>\n\n"
+        "Откройте временную ссылку ниже. Это окно браузера на вашем сервере: "
+        "войдите в ВК и подтвердите вход, если ВК попросит.\n\n"
+        "Рабочий доступ к лайкам будет проверен и сохранён автоматически. "
+        "Ссылки с токеном, пароль и коды присылать в чат не нужно.\n\n"
+        "Ссылка действует 10 минут, только для одного браузера. Не пересылайте её. "
+        "Новая ссылка отменяет предыдущую.",
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Открыть вход в ВК", url=url)],
+                [InlineKeyboardButton(text="🔑 Проверить доступ", callback_data="vklui:auth")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="vkl:menu")],
+            ]
+        ),
+    )
 
 
 @router.callback_query(F.data == "vklui:auth")
@@ -41,25 +93,52 @@ async def check_auth(query: CallbackQuery, state: FSMContext, vk_likes_workspace
     await state.clear()
     service = vk_likes_workspace.service.vk_service
     config = await service.effective_config()
+    token = likes_access_token(service.settings, config)
     source = (
-        ".env / переменная окружения VK_USER_ACCESS_TOKEN"
+        "настройки бота (веб-сеанс ВК, SQLite)"
+        if getattr(config, "web_access_token", None)
+        else ".env / переменная окружения VK_WEB_ACCESS_TOKEN (веб-запросы ВК)"
+        if getattr(service.settings, "vk_web_access_token", None)
+        else ".env / переменная окружения VK_SERVICE_ACCESS_TOKEN"
+        if getattr(service.settings, "vk_service_access_token", None)
+        else ".env / переменная окружения VK_USER_ACCESS_TOKEN"
         if getattr(service.settings, "vk_user_access_token", None)
         else "настройки бота (SQLite)"
         if config.user_access_token
         else "не задан"
     )
     text = f"<b>🔑 Доступ к ВК</b>\n\nИсточник токена: {escape(source)}\n\n"
-    if not config.user_access_token:
-        text += "Пользовательский токен не задан. Откройте «Настроить ВК»."
+    if not token:
+        text += "Токен не задан. Укажите VK_SERVICE_ACCESS_TOKEN или откройте «Настроить ВК»."
     elif not config.group_id:
         text += "Сначала укажите сообщество в «Настроить ВК»."
     else:
         try:
             client = VKClient(
-                access_token=config.user_access_token, api_version=service.settings.vk_api_version
+                access_token=token,
+                api_version=service.settings.vk_api_version,
+                web_mode=bool(likes_web_token(service.settings, config)),
             )
-            await client.request("wall.get", {"owner_id": -abs(config.group_id), "count": 1})
-            text += "✅ Авторизация принята, чтение постов сообщества доступно. Повторите сбор."
+            wall = await client.request("wall.get", {"owner_id": -abs(config.group_id), "count": 1})
+            text += "✅ Чтение постов: wall.get доступен.\n"
+            posts = wall.get("items", []) if isinstance(wall, dict) else []
+            if posts:
+                await asyncio.sleep(0.35)
+                await client.request(
+                    "likes.getList",
+                    {
+                        "type": "post",
+                        "owner_id": -abs(config.group_id),
+                        "item_id": posts[0]["id"],
+                        "count": 1,
+                    },
+                )
+                text += "✅ Список лайков: likes.getList доступен.\n"
+                await asyncio.sleep(0.35)
+                await client.request("users.get", {"user_ids": "1"})
+                text += "✅ Имена профилей: users.get доступен. Можно запускать сбор."
+            else:
+                text += "Нет постов для проверки likes.getList; доступ к списку лайков не проверен."
         except VKAPIError as exc:
             text += vk_error_text(exc)
         except (aiohttp.ClientError, TimeoutError):
@@ -366,14 +445,16 @@ async def profile_id(reference: str, workspace: VKLikesWorkspace) -> int:
     if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_.]*", name):
         raise ValueError("Не удалось прочитать ссылку на профиль ВК.")
     config = await workspace.service.vk_service.effective_config()
-    if not config.user_access_token:
+    token = likes_access_token(workspace.service.vk_service.settings, config)
+    if not token:
         raise ValueError(
             "Для короткой ссылки нужен действующий пользовательский токен ВК. "
             "Можно указать числовой ID."
         )
     client = VKClient(
-        access_token=config.user_access_token,
+        access_token=token,
         api_version=workspace.service.vk_service.settings.vk_api_version,
+        web_mode=bool(likes_web_token(workspace.service.vk_service.settings, config)),
     )
     users = await client.request("users.get", {"user_ids": name})
     if (

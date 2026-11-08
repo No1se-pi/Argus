@@ -14,6 +14,7 @@ def likes_keyboard() -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text="📎 Шаблон презентации", callback_data="vklui:template")],
             [InlineKeyboardButton(text="👥 Привязки профилей", callback_data="vklui:bindings")],
+            [InlineKeyboardButton(text="🔐 Подключить / обновить ВК", callback_data="vklui:connect")],
             [
                 InlineKeyboardButton(text="🔑 Проверить доступ ВК", callback_data="vklui:auth"),
                 InlineKeyboardButton(text="⚙️ Настроить ВК", callback_data="setup:vk"),

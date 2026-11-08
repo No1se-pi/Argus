@@ -23,3 +23,6 @@ build/
 *.egg-info/
 sessions/
 *.env
+vk_id_tokens.json
+vk_id_tokens.tmp
+vk_auth_browser/

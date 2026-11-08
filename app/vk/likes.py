@@ -20,6 +20,25 @@ from app.vk.service import VKService
 UTC = timezone.utc  # noqa: UP017 - Python 3.10 compatibility
 
 
+def likes_web_token(settings, config) -> str | None:
+    saved = getattr(config, "web_access_token", None)
+    if saved:
+        return saved
+    web_key = getattr(settings, "vk_web_access_token", None)
+    return web_key.get_secret_value() if web_key else None
+
+
+def likes_access_token(settings, config) -> str | None:
+    """Explicit website credentials, then app service key, then user token."""
+    web_key = likes_web_token(settings, config)
+    if web_key:
+        return web_key
+    service_key = getattr(settings, "vk_service_access_token", None)
+    if service_key:
+        return service_key.get_secret_value()
+    return config.user_access_token
+
+
 @dataclass(frozen=True)
 class LikesSelection:
     label: str
@@ -103,15 +122,19 @@ class VKLikesService:
             config = await self.vk_service.effective_config()
             if not config.enabled:
                 raise ValueError("VK Monitor выключен. Включите его командой /vk_watch_on.")
-            if not config.user_access_token:
-                raise ValueError("Для сбора нужен VK_USER_ACCESS_TOKEN (/vk_setup).")
+            token = likes_access_token(self.vk_service.settings, config)
+            if not token:
+                raise ValueError(
+                    "Для сбора нужен VK_SERVICE_ACCESS_TOKEN или VK_USER_ACCESS_TOKEN."
+                )
             if not config.group_id and not selection.group_reference:
                 raise ValueError(
                     "Укажите ссылку на сообщество или настройте VK_GROUP_ID (/vk_setup)."
                 )
             client = VKClient(
-                access_token=config.user_access_token,
+                access_token=token,
                 api_version=self.vk_service.settings.vk_api_version,
+                web_mode=bool(likes_web_token(self.vk_service.settings, config)),
             )
             started = datetime.now(UTC).isoformat()
             group_id = config.group_id

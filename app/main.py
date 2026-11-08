@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from telethon import TelegramClient
 
@@ -27,6 +28,7 @@ from app.storage.database import Database
 from app.storage.repositories import RepositoryBundle
 from app.storage.schema import init_schema
 from app.telegram_auth import TelegramAuthService
+from app.vk.auth_helper import VKAuthHelper
 from app.vk.likes import VKLikesService
 from app.vk.likes_repository import VKLikesRepository
 from app.vk.scheduler import VKPollingScheduler
@@ -48,6 +50,11 @@ async def main() -> None:
 
     bot = Bot(
         token=settings.bot_token.get_secret_value(),
+        session=(
+            AiohttpSession(proxy=settings.bot_proxy_url.get_secret_value())
+            if settings.bot_proxy_url
+            else None
+        ),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     alert_service = AlertService(
@@ -171,12 +178,30 @@ async def main() -> None:
     logger.info("Argus started")
 
     try:
+        if settings.vk_auth_public_url:
+            helper = VKAuthHelper(
+                public_url=settings.vk_auth_public_url,
+                bind_host=settings.vk_auth_bind_host,
+                port=settings.vk_auth_port,
+                workspace=vk_likes_workspace,
+                notify=bot.send_message,
+            )
+            try:
+                await helper.start()
+                vk_likes_workspace.auth_helper = helper
+                logger.info("VK phone login helper started")
+            except Exception:
+                await helper.close()
+                logger.warning("VK phone login helper unavailable; Bot UI remains active")
         with contextlib.suppress(asyncio.CancelledError):
             await dispatcher.start_polling(
                 bot, allowed_updates=dispatcher.resolve_used_update_types()
             )
     finally:
         logger.info("Argus shutdown started")
+        if vk_likes_workspace.auth_helper:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await vk_likes_workspace.auth_helper.close()
         for scheduler in schedulers:
             scheduler.stop()
         if analysis_worker is not None:

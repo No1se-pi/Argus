@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Подключить ВК · Argus</title>
+  <link rel="stylesheet" href="/vk-connect/style.css">
+  <script src="/vk-connect/app.js" defer></script>
+</head>
+<body>
+<main>
+  <header><span class="brand">ARGUS</span><span class="tag">Подключение ВК</span></header>
+  <h1>Один вход — отчёты в боте</h1>
+  <p>Это удалённое окно браузера на вашем сервере. Внутри открыт настоящий сайт ВК.
+     Нажимайте на изображение, чтобы управлять окном. Пароль и коды в Telegram отправлять не нужно.</p>
+  <div id="status" role="status">Нажмите «Открыть ВК», чтобы начать. Ссылка действует 10 минут.</div>
+  <button id="open" class="primary">Открыть ВК</button>
+  <section id="remote" hidden>
+    <div class="address">Сайт в удалённом браузере: <strong id="host">—</strong></div>
+    <div class="screen"><img id="screen" alt="Окно ВК на сервере" draggable="false"></div>
+    <p class="hint">Для ввода: нажмите нужное поле на изображении, затем введите текст ниже.
+      Подтверждение через приложение ВК можно выполнить на телефоне.</p>
+    <form id="typing">
+      <label for="text">Текст в выбранное поле ВК</label>
+      <div class="row"><input id="text" type="password" maxlength="1024"
+        autocomplete="off" placeholder="Телефон, код или пароль" aria-label="Текст для поля ВК">
+        <button type="submit">Ввести</button></div>
+    </form>
+    <div class="row controls">
+      <button id="enter">Enter ↵</button><button id="tab">Следующее поле</button>
+      <button id="backspace">⌫</button><button id="up">↑</button><button id="down">↓</button>
+    </div>
+    <button id="community">Вход выполнен — открыть сообщество</button>
+    <p class="hint">После входа Argus проверит доступ к лайкам и сам сохранит подключение.
+      Если окно не открылось, получите новую ссылку в боте.</p>
+  </section>
+  <div id="success" hidden><h2>ВК подключён</h2><p>Возвращайтесь в Telegram и запускайте сбор.
+    Секретные ссылки копировать не нужно.</p></div>
+  <button id="cancel" class="quiet">Закрыть подключение</button>
+</main>
+</body>
+</html>
