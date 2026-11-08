@@ -10,7 +10,7 @@ from zipfile import BadZipFile
 
 import aiohttp
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
@@ -22,6 +22,7 @@ from aiogram.types import (
 )
 
 from app.bot.states import VKLikesStates
+from app.bot.files import FILE_TIMEOUT, send_file
 from app.bot.vk_likes import (
     bind_profile_command,
     collect_and_send,
@@ -362,7 +363,7 @@ async def receive_template(
         return
     try:
         data = io.BytesIO()
-        await message.bot.download(document, destination=data)
+        await message.bot.download(document, destination=data, timeout=FILE_TIMEOUT)
         await vk_likes_workspace.save_template(data.getvalue(), document.file_name)
     except (ValueError, BadZipFile):
         await message.answer(
@@ -371,7 +372,7 @@ async def receive_template(
             reply_markup=back_keyboard(),
         )
         return
-    except (aiohttp.ClientError, TimeoutError):
+    except (aiohttp.ClientError, asyncio.TimeoutError, TelegramNetworkError):
         await message.answer(
             "Не удалось загрузить файл. Повторите отправку.", reply_markup=back_keyboard()
         )
@@ -393,7 +394,8 @@ async def download_template(query: CallbackQuery, vk_likes_workspace: VKLikesWor
                 "Сначала загрузите шаблон.", reply_markup=template_keyboard()
             )
         else:
-            await query.message.answer_document(
+            await send_file(
+                query.message,
                 BufferedInputFile(data, filename="vk_likes_template.pptx")
             )
 

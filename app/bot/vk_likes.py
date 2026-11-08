@@ -3,10 +3,12 @@ import io
 import json
 import logging
 from html import escape
+from uuid import uuid4
 from zipfile import BadZipFile
 
 import aiohttp
 from aiogram import F, Router
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
@@ -15,6 +17,7 @@ from aiogram.types import (
     Message,
 )
 
+from app.bot.files import FILE_TIMEOUT, send_file
 from app.bot.vk_likes_keyboards import likes_keyboard
 from app.vk.client import VKAPIError, vk_error_text
 from app.vk.likes import VKLikesService, parse_selection, report_csv, report_text
@@ -176,8 +179,8 @@ async def presentation_command(
         return
     template = io.BytesIO()
     try:
-        await message.bot.download(document, destination=template)
-    except (aiohttp.ClientError, TimeoutError):
+        await message.bot.download(document, destination=template, timeout=FILE_TIMEOUT)
+    except (aiohttp.ClientError, asyncio.TimeoutError, TelegramNetworkError):
         await message.answer("Не удалось загрузить файл из Telegram. Повторите отправку.")
         return
     if template.getbuffer().nbytes > 20 * 1024 * 1024:
@@ -214,16 +217,32 @@ async def send_presentation(
         bindings=bindings,
         timezone_name=service.vk_service.settings.timezone,
     )
-    await message.answer_document(
-        BufferedInputFile(result.pptx, filename="argus_vk_likes.pptx"),
-        caption="Презентация: ФИО и оформление сохранены; неподтвержденные значения — н/д.",
-    )
-    await message.answer_document(
-        BufferedInputFile(result.audit_csv(), filename="argus_vk_likes_matches.csv"),
-        caption="Сверка: исходные и текущие числа, опечатки, неоднозначные и ненайденные профили. "
-        "Привязка вручную: /vk_likes_bind VK_ID | ФИО.",
-        reply_markup=likes_keyboard(),
-    )
+    export_dir = service.vk_service.settings.database_path.parent / "exports"
+    def save_exports() -> None:
+        export_dir.mkdir(parents=True, exist_ok=True)
+        for name, content in (("argus_vk_likes.pptx", result.pptx),
+                              ("argus_vk_likes_matches.csv", result.audit_csv())):
+            target = export_dir / name
+            temporary = target.with_suffix(target.suffix + "." + uuid4().hex + ".tmp")
+            temporary.write_bytes(content)
+            temporary.replace(target)
+    await asyncio.to_thread(save_exports)
+    try:
+        await send_file(
+            message, BufferedInputFile(result.pptx, filename="argus_vk_likes.pptx"),
+            caption="Презентация: ФИО и оформление сохранены; неподтвержденные значения — н/д.",
+        )
+        await send_file(
+            message, BufferedInputFile(result.audit_csv(), filename="argus_vk_likes_matches.csv"),
+            caption="Сверка: исходные и текущие числа, опечатки, неоднозначные и ненайденные профили. "
+            "Привязка вручную: /vk_likes_bind VK_ID | ФИО.", reply_markup=likes_keyboard(),
+        )
+    except (TelegramNetworkError, aiohttp.ClientError, asyncio.TimeoutError):
+        await message.answer(
+            "PPTX сформирован, но Telegram не подтвердил передачу файлов. "
+            "Шаблон и отчёт сохранены. Повторите «PPTX из отчёта» — без нового сбора ВК.",
+            reply_markup=likes_keyboard(),
+        )
 
 
 @router.callback_query(F.data.startswith("vkl:collect:"))

@@ -59,7 +59,7 @@ class BackgroundScheduler:
                     self._stop_event.wait(),
                     timeout=self.settings.poll_interval_seconds,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 continue
 
     async def run_once(self) -> None:
@@ -110,6 +110,10 @@ class BackgroundScheduler:
             result.last_message_id,
         )
         fresh_source = await self.sources.get_source(source.id) or source
+        if self.settings.llm_risk_analysis_enabled:
+            # The independent risk collector feeds the LLM queue. Do not alert on
+            # every post or keyword match before that semantic assessment.
+            return
         for post in result.new_posts:
             if result.initialized or not is_live(post.date, self._started_at):
                 continue
@@ -136,6 +140,8 @@ class BackgroundScheduler:
             result.last_message_id,
         )
         if result.initialized or not result.new_messages:
+            return
+        if self.settings.llm_risk_analysis_enabled:
             return
         fresh_source = await self.sources.get_source(source.id) or source
         fresh_messages = [item for item in result.new_messages if is_live(item.date, self._started_at)]

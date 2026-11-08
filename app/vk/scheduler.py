@@ -9,7 +9,7 @@ from app.vk.client import VKAPIError
 from app.vk.service import VKEffectiveConfig, VKService, VKSyncResult
 
 logger = logging.getLogger(__name__)
-UTC = timezone.utc
+UTC = timezone.utc  # noqa: UP017 -- Python 3.10 compatibility
 
 
 class VKPollingScheduler:
@@ -52,7 +52,10 @@ class VKPollingScheduler:
                     self._stop_event.wait(),
                     timeout=delay,
                 )
-            except TimeoutError:
+            # On Python 3.10 asyncio.TimeoutError is not the built-in
+            # TimeoutError. Catching the latter kills this task after the
+            # first normal scheduler sleep.
+            except asyncio.TimeoutError:  # noqa: UP041 -- differs on Python 3.10
                 continue
 
     async def run_once(self) -> None:
@@ -93,7 +96,7 @@ class VKPollingScheduler:
             )
             self._log_result("VK Long Poll sync", result)
             return result
-        except TimeoutError:
+        except asyncio.TimeoutError:  # noqa: UP041 -- differs on Python 3.10
             self.service.reset_longpoll_state()
             logger.warning(
                 "VK Long Poll timed out after %ss; state reset and next cycle will reconnect",

@@ -96,6 +96,8 @@ class Settings(BaseSettings):
     telegram_analysis_queue_limit: int = 1000
     ollama_enabled: bool = True
     ollama_url: str = "http://127.0.0.1:11434"
+    ollama_proxy_url: SecretStr | None = None
+    reviews_proxy_url: SecretStr | None = None
     ollama_model: str = ""
     ollama_timeout: float = 30.0
     llm_risk_analysis_enabled: bool = True
@@ -120,6 +122,8 @@ class Settings(BaseSettings):
         "vk_group_token",
         "vk_user_access_token",
         "tg_api_hash",
+        "ollama_proxy_url",
+        "reviews_proxy_url",
         mode="before",
     )
     @classmethod

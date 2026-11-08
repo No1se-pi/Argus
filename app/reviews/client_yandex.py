@@ -44,9 +44,11 @@ class YandexReviewsClient:
         session: Any = None,
         user_agent: str = DEFAULT_USER_AGENT,
         timeout_seconds: float = 15.0,
+        proxy: str | None = None,
     ) -> None:
         self._user_agent = user_agent
         self._timeout = timeout_seconds
+        self._proxy = proxy
         self._cookie_jar: http.cookiejar.CookieJar | None = None
         self._opener: urllib.request.OpenerDirector | None = None
         self._csrf_token: str | None = None
@@ -59,9 +61,10 @@ class YandexReviewsClient:
 
     def _create_opener(self) -> urllib.request.OpenerDirector:
         self._cookie_jar = http.cookiejar.CookieJar()
-        self._opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self._cookie_jar)
-        )
+        handlers = [urllib.request.HTTPCookieProcessor(self._cookie_jar)]
+        if self._proxy:
+            handlers.append(urllib.request.ProxyHandler({"http": self._proxy, "https": self._proxy}))
+        self._opener = urllib.request.build_opener(*handlers)
         return self._opener
 
     def _initialize_session(

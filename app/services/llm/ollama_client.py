@@ -10,10 +10,14 @@ class OllamaUnavailable(RuntimeError):
 
 
 class OllamaClient:
-    def __init__(self, url: str, model: str, timeout: float = 30.0) -> None:
+    def __init__(
+        self, url: str, model: str, timeout: float = 30.0, proxy: str | None = None
+    ) -> None:
         self.url = url.rstrip("/")
         self.model = model
         self.timeout = timeout
+        self.proxy = proxy
+        self._semaphore = asyncio.Semaphore(1)
         self.last_latency_ms: int | None = None
         self.last_error: str | None = None
         self.failure_count = 0
@@ -26,6 +30,10 @@ class OllamaClient:
         return round(sum(self._latencies) / len(self._latencies))
 
     async def generate(self, *, system: str, prompt: str, json_mode: bool = True) -> str:
+        async with self._semaphore:
+            return await self._generate(system=system, prompt=prompt, json_mode=json_mode)
+
+    async def _generate(self, *, system: str, prompt: str, json_mode: bool = True) -> str:
         if not self.model:
             raise OllamaUnavailable("OLLAMA_MODEL is not configured")
         started = monotonic()
@@ -34,6 +42,7 @@ class OllamaClient:
             "system": system,
             "prompt": prompt,
             "stream": False,
+            "think": False,
             "options": {"temperature": 0},
         }
         if json_mode:
@@ -41,7 +50,9 @@ class OllamaClient:
         try:
             timeout = aiohttp.ClientTimeout(total=self.timeout)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(f"{self.url}/api/generate", json=payload) as response:
+                async with session.post(
+                    f"{self.url}/api/generate", json=payload, proxy=self.proxy
+                ) as response:
                     if response.status != 200:
                         raise OllamaUnavailable(f"Ollama HTTP {response.status}")
                     data = await response.json()
@@ -63,7 +74,7 @@ class OllamaClient:
         try:
             timeout = aiohttp.ClientTimeout(total=min(self.timeout, 5.0))
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(f"{self.url}/api/tags") as response:
+                async with session.get(f"{self.url}/api/tags", proxy=self.proxy) as response:
                     return response.status == 200
         except (aiohttp.ClientError, asyncio.TimeoutError):
             return False

@@ -31,9 +31,67 @@ from app.reviews.models import (
 )
 from app.reviews.scheduler import ReviewsPollingScheduler
 from app.reviews.service import ReviewsService
+from app.services.llm.reviews import ReviewClassifier
 from app.storage.database import Database
 from app.storage.repositories import RepositoryBundle
 from app.storage.schema import init_schema
+from app.services.llm.reviews import ReviewClassification
+
+
+@pytest.mark.parametrize("raw", [
+    '{}', '[]', '{"sentiment":"neutral","confidence":0.9,"reason":"x"}',
+    '{"sentiment":"negative","confidence":true,"reason":"x"}',
+    '{"sentiment":"negative","confidence":NaN,"reason":"x"}',
+    '{"sentiment":"negative","confidence":0,"reason":"x"}',
+])
+def test_review_classifier_rejects_invalid_output(raw):
+    with pytest.raises(ValueError):
+        ReviewClassifier.parse(raw)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sentiment,expected", [("positive", 0), ("negative", 1)])
+async def test_reviews_alert_only_for_negative_llm_result(test_env, sentiment, expected):
+    env = test_env
+    await env["service"].ensure_default_sources()
+    source = (await env["bundle"].reviews.list_sources())[0]
+    review = ReviewItem(
+        platform=source.platform, external_review_id="sentiment-case", branch_name=source.branch_name,
+        author_name="Test", rating=5, text="Review text", published_at=datetime.now(UTC).isoformat(),
+        review_url=source.url, raw_payload_json="{}",
+    )
+    await env["bundle"].reviews.save_reviews([review], source.id, mark_sent=False)
+    env["service"].classifier.classify.return_value = ReviewClassification(sentiment, .9, "Reason")
+    assert await env["service"].deliver_pending_reviews() == expected
+    assert len(env["bot"].sent_messages) == expected
+    assert await env["service"].deliver_pending_reviews() == 0
+    assert env["service"].classifier.classify.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_review_llm_failure_stays_pending_with_backoff(test_env):
+    env = test_env
+    await env["service"].ensure_default_sources()
+    source = (await env["bundle"].reviews.list_sources())[0]
+    review = ReviewItem(
+        platform=source.platform, external_review_id="llm-failure", branch_name=source.branch_name,
+        author_name="Test", rating=1, text="Complaint", published_at=datetime.now(UTC).isoformat(),
+        review_url=source.url, raw_payload_json="{}",
+    )
+    await env["bundle"].reviews.save_reviews([review], source.id, mark_sent=False)
+    env["service"].classifier.classify.side_effect = ValueError("Invalid response")
+    assert await env["service"].deliver_pending_reviews() == 0
+    assert not env["bot"].sent_messages
+    assert await env["service"].deliver_pending_reviews() == 0
+    assert env["service"].classifier.classify.await_count == 1
+    connection=env["db"].require_connection()
+    async with connection.execute("SELECT attempts,last_error FROM review_analysis") as cursor:
+        row=await cursor.fetchone()
+        assert row["attempts"] == 1 and row["last_error"] == "ValueError"
+    await connection.execute("UPDATE review_analysis SET next_retry_at=NULL")
+    await connection.commit()
+    env["service"].classifier.classify.side_effect=None
+    assert await env["service"].deliver_pending_reviews() == 1
 
 
 class DummyBot:
@@ -141,6 +199,10 @@ async def test_env(tmp_path: Path):
         runtime_settings=bundle.runtime_settings,
         repository=bundle.reviews,
         alerts=alert_service,
+        classifier=MagicMock(
+            client=MagicMock(model="test-model"),
+            classify=AsyncMock(return_value=ReviewClassification("negative", 0.9, "Test complaint")),
+        ),
         yandex_client=yandex_client,
         dgis_client=dgis_client,
     )

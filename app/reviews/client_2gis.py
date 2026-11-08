@@ -25,12 +25,14 @@ class DGisReviewsClient:
         user_agent: str = DEFAULT_USER_AGENT,
         api_key: str = DEFAULT_2GIS_KEY,
         timeout_seconds: float = 15.0,
+        proxy: str | None = None,
     ) -> None:
         self._external_session = session is not None
         self._session = session
         self._user_agent = user_agent
         self._api_key = api_key
         self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        self._proxy = proxy
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -52,7 +54,7 @@ class DGisReviewsClient:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             }
-            async with session.get(firm_url, headers=headers) as resp:
+            async with session.get(firm_url, headers=headers, proxy=self._proxy) as resp:
                 if resp.status != 200:
                     return False
                 html = await resp.text(errors="replace")
@@ -89,7 +91,7 @@ class DGisReviewsClient:
             url = f"{api_base}?{urllib.parse.urlencode(params)}"
 
             try:
-                async with session.get(url) as resp:
+                async with session.get(url, proxy=self._proxy) as resp:
                     http_status = resp.status
 
                     if http_status in (401, 403) and attempt == 0:

@@ -451,6 +451,12 @@ class AlertService:
         )
 
         single_msg = header_full + escape(raw_text) + link_html
+        if getattr(review, "sentiment", None) == "negative":
+            reason = escape((getattr(review, "analysis_reason", "") or "")[:500])
+            header_full = header_full.replace("🆕 <b>Новый отзыв</b>", "🔴 <b>Негативный отзыв</b>")
+            header_full = header_full.replace("<b>Текст:</b>",
+                                             f"<b>Оценка LLM:</b> негативный\n{reason}\n\n<b>Текст:</b>")
+            single_msg = header_full + escape(raw_text) + link_html
         if len(single_msg) <= 4000:
             return [single_msg]
 

@@ -23,6 +23,7 @@ from app.reviews.models import (
     ReviewSyncResult,
     ReviewSyncStatus,
 )
+from app.services.llm.reviews import REVIEW_PROMPT_VERSION, ReviewClassifier
 from app.storage.repositories import ReviewRepository, RuntimeSettingsRepository
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ class ReviewsService:
         yandex_client: YandexReviewsClient | None = None,
         dgis_client: DGisReviewsClient | None = None,
         notify_since: datetime | None = None,
+        classifier: ReviewClassifier | None = None,
     ) -> None:
         self.settings = settings
         self.runtime_settings = runtime_settings
@@ -49,15 +51,23 @@ class ReviewsService:
         self._sync_lock = asyncio.Lock()
         self._default_sources_seeded = False
         self.notify_since = notify_since
+        self.classifier = classifier
+        self._delivery_lock = asyncio.Lock()
 
     def _get_yandex_client(self) -> YandexReviewsClient:
         if self._yandex_client is None:
-            self._yandex_client = YandexReviewsClient()
+            self._yandex_client = YandexReviewsClient(
+                proxy=self.settings.reviews_proxy_url.get_secret_value()
+                if self.settings.reviews_proxy_url else None,
+            )
         return self._yandex_client
 
     def _get_dgis_client(self) -> DGisReviewsClient:
         if self._dgis_client is None:
-            self._dgis_client = DGisReviewsClient()
+            self._dgis_client = DGisReviewsClient(
+                proxy=self.settings.reviews_proxy_url.get_secret_value()
+                if self.settings.reviews_proxy_url else None,
+            )
         return self._dgis_client
 
     async def close(self) -> None:
@@ -96,6 +106,7 @@ class ReviewsService:
             error_alert_threshold=error_threshold,
             max_backoff_seconds=max_backoff,
             alerts_enabled=alerts_enabled,
+            llm_model=self.classifier.client.model if self.classifier is not None else "",
         )
 
     async def ensure_default_sources(self) -> int:
@@ -478,6 +489,10 @@ class ReviewsService:
         )
 
     async def deliver_pending_reviews(self) -> int:
+        async with self._delivery_lock:
+            return await self._deliver_pending_reviews()
+
+    async def _deliver_pending_reviews(self) -> int:
         config = await self.effective_config()
         if not config.alerts_enabled:
             return 0
@@ -485,7 +500,8 @@ class ReviewsService:
         unsent = await self.repository.get_unsent_reviews(limit=50)
         sent_count = 0
         for review in unsent:
-            if self.notify_since is not None and not is_live(review.published_at, self.notify_since):
+            if (self.notify_since is not None and review.sentiment is None
+                    and not is_live(review.published_at, self.notify_since)):
                 # Same silent-baseline convention as initial historical imports.
                 await self.repository.update_delivery_progress(
                     review.id, parts_sent=review.telegram_parts_total,
@@ -513,6 +529,27 @@ class ReviewsService:
                 continue
 
             try:
+                if review.sentiment is None:
+                    try:
+                        if self.classifier is None:
+                            raise ValueError("Review LLM is not configured")
+                        result = await self.classifier.classify(
+                            review.text if not review.is_empty_text else "", review.rating
+                        )
+                        await self.repository.save_review_analysis(
+                            review.id, result, self.classifier.client.model, REVIEW_PROMPT_VERSION
+                        )
+                        review.sentiment = result.sentiment
+                        review.analysis_reason = result.reason
+                    except Exception as exc:
+                        await self.repository.mark_review_analysis_error(
+                            review.id, type(exc).__name__
+                        )
+                        logger.warning("Review analysis pending retry review_id=%s error=%s",
+                                       review.id, type(exc).__name__)
+                        continue
+                if review.sentiment != "negative":
+                    continue
                 ok = await self.alerts.send_review_alert(
                     review=review,
                     source=source,

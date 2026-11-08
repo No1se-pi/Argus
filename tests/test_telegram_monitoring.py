@@ -13,6 +13,86 @@ from app.storage.repositories import RepositoryBundle
 from app.storage.schema import init_schema
 
 
+@pytest.mark.asyncio
+async def test_llm_status_button_displays_model_and_queue(monkeypatch):
+    from unittest.mock import AsyncMock
+    import app.bot.callbacks as callbacks
+
+    edit = AsyncMock()
+    monkeypatch.setattr(callbacks, "_edit", edit)
+    await callbacks.monitoring_llm_callback(
+        SimpleNamespace(),
+        SimpleNamespace(ollama_enabled=True, ollama_model="test-model"),
+        SimpleNamespace(pending_count=AsyncMock(return_value=7)),
+        SimpleNamespace(average_latency_ms=100, last_error=None),
+    )
+    edit.assert_awaited_once()
+    assert "test-model" in edit.await_args.args[1]
+    assert "7" in edit.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_history_button_finishes_without_llm_status_variables(monkeypatch):
+    from unittest.mock import AsyncMock
+    import app.bot.callbacks as callbacks
+
+    edit = AsyncMock()
+    monkeypatch.setattr(callbacks, "_edit", edit)
+    collector = SimpleNamespace(backfill_analysis=AsyncMock(
+        return_value=SimpleNamespace(fetched_count=2, saved_count=2)))
+    await callbacks.monitoring_backfill_callback(
+        SimpleNamespace(data="tgm:backfill:50", answer=AsyncMock()), collector,
+        SimpleNamespace(list_sources=AsyncMock(return_value=[SimpleNamespace(id=1)])),
+    )
+    edit.assert_awaited_once()
+    collector.backfill_analysis.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_risk_delivery_retries_only_failed_target_after_restart(tmp_path):
+    from unittest.mock import AsyncMock
+    from datetime import datetime, timezone
+    from app.services.telegram_monitoring import AnalysisWorker
+
+    db = Database(tmp_path / "deliveries.sqlite3")
+    await db.connect()
+    try:
+        await init_schema(db)
+        repos = RepositoryBundle(db)
+        source = await repos.sources.upsert_telegram_source(
+            link="@test", username="test", title="Test", entity_id=123,
+            access_hash=456, entity_type="channel",
+        )
+        message_id, _ = await repos.telegram_monitoring.save_message(
+            source_id=source.id, telegram_message_id=1, reply_to_message_id=None,
+            text="Test", message_date=datetime.now(timezone.utc).isoformat(),
+            message_url=None, prefilter_priority=5,
+        )
+        alert_id = await repos.telegram_monitoring.create_risk_alert(message_id)
+        await repos.telegram_monitoring.queue_risk_deliveries(alert_id, [1, 2], "Test alert")
+        bot = SimpleNamespace(send_message=AsyncMock(side_effect=[RuntimeError("network"), None]))
+        worker = AnalysisWorker(settings=SimpleNamespace(llm_max_concurrent_requests=1),
+                                repositories=repos, classifier=None, bot=bot)
+        await worker._deliver_alerts()
+        assert bot.send_message.await_count == 2
+        await worker._deliver_alerts()
+        assert bot.send_message.await_count == 2  # Retry deadline has not arrived.
+        connection = db.require_connection()
+        await connection.execute("UPDATE telegram_risk_deliveries SET next_retry_at=NULL")
+        await connection.commit()
+        await db.close()
+        await db.connect()
+        restarted_bot = SimpleNamespace(send_message=AsyncMock())
+        restarted_worker = AnalysisWorker(settings=SimpleNamespace(llm_max_concurrent_requests=1),
+                                          repositories=RepositoryBundle(db), classifier=None, bot=restarted_bot)
+        await restarted_worker._deliver_alerts()
+        restarted_bot.send_message.assert_awaited_once()
+        assert restarted_bot.send_message.await_args.args[0] == 1
+        assert not await repos.telegram_monitoring.pending_risk_deliveries()
+    finally:
+        await db.close()
+
+
 def test_valid_llm_json_is_strictly_parsed():
     result = MessageClassifier.parse(
         '{"risk":true,"severity":2,"confidence":0.87,'
@@ -69,6 +149,11 @@ async def test_message_deduplication(tmp_path):
     assert first_id == second_id
     assert first_created is True
     assert second_created is False
+    await repositories.telegram_monitoring.save_message(
+        **{**args, "telegram_message_id": 11, "prefilter_priority": 10, "alert_eligible": False}
+    )
+    rows = await repositories.telegram_monitoring.pending(1)
+    assert rows[0]["id"] == first_id  # A historical backfill must not delay live messages.
     await database.close()
 
 

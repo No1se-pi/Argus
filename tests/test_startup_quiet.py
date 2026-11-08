@@ -115,6 +115,25 @@ async def test_restart_catchup_is_silent_and_moves_shared_cursor_to_head(collect
 
 
 @pytest.mark.asyncio
+async def test_live_risk_poll_uses_own_cursor_and_keeps_overflow(collection):
+    repos, source, settings = collection
+    settings.telegram_catchup_limit = 2
+    await repos.sources.set_last_message_id(source.id, 500)
+    await repos.runtime_settings.set(f"telegram_risk_cursor:{source.id}", "100")
+    client = SimpleNamespace(get_messages=AsyncMock(side_effect=[
+        [message(600)], [message(101), message(102)],
+    ]))
+    monitor = TelegramRealtimeMonitor(client=client, settings=settings, repositories=repos)
+    await monitor.catch_up(alert_eligible=True)
+    assert await repos.runtime_settings.get(f"telegram_risk_cursor:{source.id}") == "102"
+    assert (await repos.sources.get_source(source.id)).last_message_id == 500
+    assert client.get_messages.await_args.kwargs["reverse"] is True
+    rows = await repos.telegram_monitoring.pending(20)
+    assert {row["telegram_message_id"] for row in rows} == {101, 102}
+    assert all(row["alert_eligible"] == 1 for row in rows)
+
+
+@pytest.mark.asyncio
 async def test_old_pending_analysis_never_sends_risk_alerts():
     repository = SimpleNamespace(
         save_analysis=AsyncMock(return_value=True),
@@ -127,7 +146,10 @@ async def test_old_pending_analysis_never_sends_risk_alerts():
     )
     worker = AnalysisWorker(
         settings=SimpleNamespace(llm_max_concurrent_requests=1, llm_alert_min_severity=2),
-        repositories=SimpleNamespace(telegram_monitoring=repository),
+        repositories=SimpleNamespace(
+            telegram_monitoring=repository,
+            runtime_settings=SimpleNamespace(get_bool=AsyncMock(return_value=True)),
+        ),
         classifier=classifier,
         bot=None,
     )

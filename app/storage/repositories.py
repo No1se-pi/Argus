@@ -820,7 +820,7 @@ class TelegramMonitoringRepository:
         await connection.commit()
         return int(row["id"]), created
 
-    async def pending(self, limit: int) -> list[dict]:
+    async def pending(self, limit: int, *, priority_only: bool = False) -> list[dict]:
         connection = self.database.require_connection()
         async with connection.execute(
             """SELECT m.*, s.title AS source_title, s.username AS source_username,
@@ -830,9 +830,10 @@ class TelegramMonitoringRepository:
                  ON reply.source_id=m.source_id
                 AND reply.telegram_message_id=m.reply_to_message_id
                WHERE m.analysis_status IN ('pending', 'error')
+                 AND (? = 0 OR m.prefilter_priority > 0)
                  AND (m.next_analysis_at IS NULL OR m.next_analysis_at <= ?)
-               ORDER BY m.prefilter_priority DESC, m.collected_at ASC LIMIT ?""",
-            (utc_now_iso(), limit),
+               ORDER BY m.alert_eligible DESC, m.prefilter_priority DESC, m.collected_at ASC LIMIT ?""",
+            (int(priority_only), utc_now_iso(), limit),
         ) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
@@ -852,7 +853,7 @@ class TelegramMonitoringRepository:
             """UPDATE telegram_messages SET analysis_status='pending'
                WHERE id IN (
                  SELECT id FROM telegram_messages WHERE analysis_status='deferred'
-                 ORDER BY prefilter_priority DESC, collected_at ASC LIMIT ?
+                 ORDER BY alert_eligible DESC, prefilter_priority DESC, collected_at ASC LIMIT ?
                )""",
             (limit,),
         )
@@ -930,6 +931,33 @@ class TelegramMonitoringRepository:
         if cursor.rowcount != 1:
             return None
         return int(cursor.lastrowid)
+
+    async def queue_risk_deliveries(self, alert_id: int, targets: list[int], text: str) -> None:
+        connection = self.database.require_connection()
+        await connection.executemany(
+            "INSERT OR IGNORE INTO telegram_risk_deliveries(alert_id,chat_id,text) VALUES(?,?,?)",
+            [(alert_id, target, text) for target in set(targets)],
+        )
+        await connection.commit()
+
+    async def pending_risk_deliveries(self, limit: int = 50) -> list[dict]:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """SELECT * FROM telegram_risk_deliveries WHERE sent_at IS NULL
+               AND (next_retry_at IS NULL OR next_retry_at <= ?) ORDER BY alert_id LIMIT ?""",
+            (utc_now_iso(), limit),
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def finish_risk_delivery(self, alert_id: int, chat_id: int, error: str | None = None) -> None:
+        connection = self.database.require_connection()
+        retry = (datetime.now(UTC) + timedelta(minutes=1)).isoformat() if error else None
+        await connection.execute(
+            """UPDATE telegram_risk_deliveries SET sent_at=?, attempts=attempts+1,
+               next_retry_at=?, last_error=? WHERE alert_id=? AND chat_id=?""",
+            (None if error else utc_now_iso(), retry, error, alert_id, chat_id),
+        )
+        await connection.commit()
 
     async def aggregate_day(self, date: str, source_id: int) -> dict:
         connection = self.database.require_connection()
@@ -1499,6 +1527,8 @@ class ReviewRepository:
             last_delivery_error=row["last_delivery_error"]
             if "last_delivery_error" in row.keys()
             else None,
+            sentiment=row["sentiment"] if "sentiment" in row.keys() else None,
+            analysis_reason=row["analysis_reason"] if "analysis_reason" in row.keys() else None,
         )
 
     async def ensure_default_sources(self, sources: list[dict]) -> int:
@@ -1698,17 +1728,44 @@ class ReviewRepository:
         connection = self.database.require_connection()
         async with connection.execute(
             """
-            SELECT r.*, s.branch_name
+            SELECT r.*, s.branch_name, a.sentiment, a.reason AS analysis_reason
             FROM reviews r
             JOIN review_sources s ON r.source_id = s.id
+            LEFT JOIN review_analysis a ON a.review_id=r.id
             WHERE r.is_sent_to_telegram = 0
+              AND (a.sentiment IS NULL OR a.sentiment='negative')
+              AND (a.next_retry_at IS NULL OR a.next_retry_at<=?)
             ORDER BY r.published_at ASC, r.id ASC
             LIMIT ?
             """,
-            (limit,),
+            (utc_now_iso(), limit),
         ) as cursor:
             rows = await cursor.fetchall()
         return [self._row_to_review(row) for row in rows]
+
+    async def save_review_analysis(self, review_id: int, result, model: str, version: str) -> None:
+        connection = self.database.require_connection()
+        await connection.execute(
+            """INSERT INTO review_analysis
+               (review_id,sentiment,confidence,reason,model,prompt_version,analyzed_at)
+               VALUES (?,?,?,?,?,?,?) ON CONFLICT(review_id) DO UPDATE SET
+               sentiment=excluded.sentiment, confidence=excluded.confidence,
+               reason=excluded.reason, model=excluded.model, prompt_version=excluded.prompt_version,
+               analyzed_at=excluded.analyzed_at,last_error=NULL,next_retry_at=NULL""",
+            (review_id,result.sentiment,result.confidence,result.reason,model,version,utc_now_iso()),
+        )
+        await connection.commit()
+
+    async def mark_review_analysis_error(self, review_id: int, error: str) -> None:
+        connection = self.database.require_connection()
+        retry_at = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+        await connection.execute(
+            """INSERT INTO review_analysis(review_id,attempts,last_error,next_retry_at)
+               VALUES (?,1,?,?) ON CONFLICT(review_id) DO UPDATE SET
+               attempts=review_analysis.attempts+1,last_error=excluded.last_error,
+               next_retry_at=excluded.next_retry_at""", (review_id,error[:200],retry_at),
+        )
+        await connection.commit()
 
     async def update_delivery_progress(
         self,
@@ -1782,15 +1839,27 @@ class ReviewRepository:
         async with connection.execute("SELECT COUNT(*) AS c FROM reviews") as cur:
             total_reviews = int((await cur.fetchone())["c"])
         async with connection.execute(
-            "SELECT COUNT(*) AS c FROM reviews WHERE is_sent_to_telegram = 0"
+            """SELECT COUNT(*) AS c FROM reviews r
+               LEFT JOIN review_analysis a ON a.review_id=r.id
+               WHERE r.is_sent_to_telegram=0 AND a.sentiment='negative'"""
         ) as cur:
             unsent_reviews = int((await cur.fetchone())["c"])
+        async with connection.execute(
+            """SELECT SUM(CASE WHEN a.sentiment='positive' THEN 1 ELSE 0 END) AS positive,
+               SUM(CASE WHEN a.sentiment='negative' THEN 1 ELSE 0 END) AS negative,
+               SUM(CASE WHEN a.sentiment IS NULL AND r.is_sent_to_telegram=0 THEN 1 ELSE 0 END) AS pending
+               FROM reviews r LEFT JOIN review_analysis a ON a.review_id=r.id"""
+        ) as cur:
+            classified = await cur.fetchone()
         return {
             "total_sources": total_sources,
             "active_sources": active_sources,
             "degraded_sources": degraded_sources,
             "total_reviews": total_reviews,
             "unsent_reviews": unsent_reviews,
+            "positive_reviews": int(classified["positive"] or 0),
+            "negative_reviews": int(classified["negative"] or 0),
+            "pending_analysis": int(classified["pending"] or 0),
         }
 
 

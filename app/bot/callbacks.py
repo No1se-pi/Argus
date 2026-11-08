@@ -248,6 +248,17 @@ async def monitoring_llm_callback(
         f"\nСредняя latency: <b>{latency} ms</b>" if latency is not None else ""
     )
 
+    if ollama_client and ollama_client.last_error:
+        runtime += f"\nПоследняя ошибка: {escape(ollama_client.last_error[:200])}"
+    await _edit(
+        query,
+        "🧠 <b>Ollama</b>\n\n"
+        f"Статус: {'✅ настроена' if ready else '⚠️ не настроена'}\n"
+        f"Модель: <code>{escape(settings.ollama_model or 'не задана')}</code>\n"
+        f"Очередь анализа: <b>{queued}</b>{runtime}",
+        telegram_menu_keyboard(True),
+    )
+
 
 @router.callback_query(F.data.startswith("tgm:stats:"))
 async def monitoring_stats_callback(
@@ -356,16 +367,6 @@ async def monitoring_backfill_callback(
         f"Ошибок источников: <b>{failed}</b>\n\n"
         "Исторические сообщения попадут в статистику, но не создадут старые алерты.",
         monitoring_stats_keyboard(1),
-    )
-    if ollama_client and ollama_client.last_error:
-        runtime += f"\nПоследняя ошибка: {escape(ollama_client.last_error[:200])}"
-    await _edit(
-        query,
-        "🧠 <b>Ollama</b>\n\n"
-        f"Статус: {'✅ настроена' if ready else '⚠️ не настроена'}\n"
-        f"Модель: <code>{escape(settings.ollama_model or 'не задана')}</code>\n"
-        f"Очередь анализа: <b>{queued}</b>{runtime}",
-        telegram_menu_keyboard(True),
     )
 
 

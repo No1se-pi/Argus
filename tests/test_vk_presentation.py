@@ -1,6 +1,6 @@
 import io
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from zipfile import ZipFile
 
 import pytest
@@ -196,35 +196,40 @@ def test_audit_keeps_original_and_current_counts_and_typo_warning():
 
 
 @pytest.mark.asyncio
-async def test_bot_upload_returns_filled_pptx_and_separate_audit():
+async def test_bot_upload_returns_filled_pptx_and_separate_audit(tmp_path):
     source = template_bytes(["Колындёнков Вадим Дмитриевич"])
     document = SimpleNamespace(file_name="template.pptx", file_size=len(source))
     settings = SimpleNamespace(get=AsyncMock(return_value=None))
     service = SimpleNamespace(
         vk_service=SimpleNamespace(
-            settings=SimpleNamespace(timezone="Europe/Moscow"), runtime_settings=settings
+            settings=SimpleNamespace(timezone="Europe/Moscow", database_path=tmp_path / "argus.db"), runtime_settings=settings
         ),
         collect=AsyncMock(return_value=report_for([(1, "Вадим Колынденков", 3)])),
     )
 
-    async def download(_document, *, destination):
+    async def download(_document, *, destination, timeout):
+        assert timeout == 300
         destination.write(source)
 
     message = SimpleNamespace(
         document=document,
         reply_to_message=None,
-        bot=SimpleNamespace(download=AsyncMock(side_effect=download)),
+        bot=AsyncMock(),
         answer=AsyncMock(),
-        answer_document=AsyncMock(),
+        answer_document=MagicMock(),
     )
+    message.bot.download = AsyncMock(side_effect=download)
     await presentation_command(
         message, CommandObject(command="vk_likes_pptx", args="2026-10-12 2026-10-19"), service
     )
     assert service.collect.await_count == 1
-    assert message.answer_document.await_count == 2
-    pptx, audit = [call.args[0] for call in message.answer_document.await_args_list]
+    assert message.answer_document.call_count == 2
+    assert all(call.kwargs["request_timeout"] == 300 for call in message.bot.await_args_list)
+    pptx, audit = [call.args[0] for call in message.answer_document.call_args_list]
     assert pptx.filename.endswith(".pptx") and pptx.data.startswith(b"PK")
     assert audit.filename.endswith(".csv")
+    assert (tmp_path / "exports" / "argus_vk_likes.pptx").read_bytes() == pptx.data
+    assert (tmp_path / "exports" / "argus_vk_likes_matches.csv").read_bytes() == audit.data
     assert "Колындёнков Вадим Дмитриевич" in audit.data.decode("utf-8-sig")
 
 

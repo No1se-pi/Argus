@@ -23,6 +23,7 @@ from app.scheduler.rate_limit import TelegramRateLimiter
 from app.services.daily_digest import DailyDigestScheduler, DailyDigestService
 from app.services.llm.classifier import MessageClassifier
 from app.services.llm.ollama_client import OllamaClient
+from app.services.llm.reviews import ReviewClassifier
 from app.services.telegram_monitoring import AnalysisWorker, TelegramRealtimeMonitor
 from app.storage.database import Database
 from app.storage.repositories import RepositoryBundle
@@ -64,7 +65,9 @@ async def main() -> None:
         runtime_settings=repositories.runtime_settings,
     )
     ollama = (
-        OllamaClient(settings.ollama_url, settings.ollama_model, settings.ollama_timeout)
+        OllamaClient(settings.ollama_url, settings.ollama_model, settings.ollama_timeout,
+                     proxy=settings.ollama_proxy_url.get_secret_value()
+                     if settings.ollama_proxy_url else None)
         if settings.ollama_enabled
         else None
     )
@@ -84,6 +87,7 @@ async def main() -> None:
         repository=repositories.reviews,
         alerts=alert_service,
         notify_since=started_at,
+        classifier=ReviewClassifier(ollama) if ollama is not None and ollama.model else None,
     )
     vk_likes_service = VKLikesService(vk_service, VKLikesRepository(database))
     vk_likes_workspace = VKLikesWorkspace(vk_likes_service)
@@ -137,6 +141,7 @@ async def main() -> None:
             client=telegram_client, settings=settings, repositories=repositories
         )
         await realtime_monitor.start()
+        tasks.append(asyncio.create_task(realtime_monitor.run(), name="argus-risk-source-poll"))
         telegram_scheduler = BackgroundScheduler(
             settings=settings,
             sources=repositories.sources,

@@ -52,6 +52,8 @@ class ReviewItem:
     is_sent_to_telegram: bool = False
     telegram_sent_at: str | None = None
     last_delivery_error: str | None = None
+    sentiment: str | None = None
+    analysis_reason: str | None = None
 
     @property
     def is_empty_text(self) -> bool:
@@ -113,6 +115,7 @@ class ReviewsEffectiveConfig:
     error_alert_threshold: int
     max_backoff_seconds: int
     alerts_enabled: bool
+    llm_model: str = ""
 
 
 DEFAULT_SOURCES: list[dict[str, Any]] = [

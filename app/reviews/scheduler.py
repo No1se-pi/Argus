@@ -94,7 +94,7 @@ class ReviewsPollingScheduler:
                 if wait_after:
                     try:
                         await asyncio.wait_for(self._wake_event.wait(), timeout=5.0)
-                    except TimeoutError:
+                    except asyncio.TimeoutError:
                         pass
                 return
 
@@ -112,7 +112,7 @@ class ReviewsPollingScheduler:
                             self._stop_event.wait(),
                             timeout=float(config.poll_interval_seconds),
                         )
-                    except TimeoutError:
+                    except asyncio.TimeoutError:
                         pass
                 return
 
@@ -140,7 +140,7 @@ class ReviewsPollingScheduler:
                         self._stop_event.wait(),
                         timeout=float(config.poll_interval_seconds),
                     )
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     pass
 
         except asyncio.CancelledError:
@@ -173,7 +173,7 @@ class ReviewsPollingScheduler:
             if wait_after:
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=float(backoff))
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     pass
 
     async def run(self) -> None:

@@ -126,6 +126,17 @@ CREATE TABLE IF NOT EXISTS telegram_risk_alerts (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS telegram_risk_deliveries (
+    alert_id INTEGER NOT NULL REFERENCES telegram_risk_alerts(id) ON DELETE CASCADE,
+    chat_id INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    sent_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TEXT,
+    last_error TEXT,
+    PRIMARY KEY(alert_id, chat_id)
+);
+
 CREATE TABLE IF NOT EXISTS telegram_daily_stats (
     date TEXT NOT NULL,
     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
@@ -316,6 +327,19 @@ CREATE TABLE IF NOT EXISTS reviews (
 CREATE INDEX IF NOT EXISTS idx_reviews_source ON reviews(source_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_sent ON reviews(is_sent_to_telegram);
 CREATE INDEX IF NOT EXISTS idx_reviews_published ON reviews(published_at);
+
+CREATE TABLE IF NOT EXISTS review_analysis (
+    review_id INTEGER PRIMARY KEY REFERENCES reviews(id) ON DELETE CASCADE,
+    sentiment TEXT CHECK(sentiment IN ('positive','negative')),
+    confidence REAL,
+    reason TEXT,
+    model TEXT,
+    prompt_version TEXT,
+    analyzed_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    next_retry_at TEXT
+);
 """
 
 
