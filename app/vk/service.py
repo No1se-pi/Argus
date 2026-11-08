@@ -17,7 +17,7 @@ from app.storage.repositories import RuntimeSettingsRepository, VkRepository, ma
 from app.vk.client import VKAPIError, VKClient
 
 logger = logging.getLogger(__name__)
-UTC = timezone.utc
+UTC = timezone.utc  # noqa: UP017 -- Python 3.10 compatibility
 
 
 @dataclass(frozen=True)
@@ -71,22 +71,23 @@ class VKService:
         if runtime_enabled is not None:
             enabled = runtime_enabled.strip().lower() in {"1", "true", "yes", "on"}
 
-        group_token = self._secret_value(self.settings.vk_group_token)
-        if not group_token:
-            group_token = self._secret_value(self.settings.vk_access_token)
-        if not group_token:
-            group_token = await self.runtime_settings.get("vk_group_token")
+        # Values entered through the bot are intentional live overrides. If
+        # .env won here, an old token would remain active even after the setup
+        # UI confirmed that its replacement had been saved.
+        group_token = await self.runtime_settings.get("vk_group_token")
         if not group_token:
             group_token = await self.runtime_settings.get("vk_access_token")
+        if not group_token:
+            group_token = self._secret_value(self.settings.vk_group_token)
+        if not group_token:
+            group_token = self._secret_value(self.settings.vk_access_token)
 
-        user_access_token = self._secret_value(self.settings.vk_user_access_token)
+        user_access_token = await self.runtime_settings.get("vk_user_access_token")
         if not user_access_token:
-            user_access_token = await self.runtime_settings.get("vk_user_access_token")
+            user_access_token = self._secret_value(self.settings.vk_user_access_token)
 
-        group_id = self.settings.vk_group_id
-        if group_id is None:
-            raw_group_id = await self.runtime_settings.get("vk_group_id")
-            group_id = int(raw_group_id) if raw_group_id else None
+        raw_group_id = await self.runtime_settings.get("vk_group_id")
+        group_id = int(raw_group_id) if raw_group_id else self.settings.vk_group_id
 
         monitor_mode = await self.runtime_settings.get("vk_monitor_mode")
         return VKEffectiveConfig(
@@ -285,13 +286,45 @@ class VKService:
             async with session.get(server, params=params, timeout=timeout) as response:
                 data = await response.json(content_type=None)
 
-        if "failed" in data:
-            failed_code = int(data["failed"])
-            if failed_code == 1 and data.get("ts"):
-                self._longpoll_ts = str(data["ts"])
-                return VKSyncResult(config.group_id, 0, 0, [], [])
-            await self._get_longpoll_state(client, config.group_id, force_refresh=True)
-            raise VKAPIError(f"VK Long Poll failed with code {failed_code}")
+            if "failed" in data:
+                failed_code = int(data["failed"])
+                if failed_code == 1 and data.get("ts"):
+                    self._longpoll_ts = str(data["ts"])
+                    return VKSyncResult(config.group_id, 0, 0, [], [])
+
+                # Codes 2 and 3 mean an expired key or stale state. Refresh
+                # and retry immediately so a manual sync does not fail once
+                # merely to prepare the following attempt.
+                if failed_code in {2, 3}:
+                    server, key, ts = await self._get_longpoll_state(
+                        client,
+                        config.group_id,
+                        force_refresh=True,
+                    )
+                    retry_params = {
+                        "act": "a_check",
+                        "key": key,
+                        "ts": ts,
+                        "wait": wait_seconds,
+                    }
+                    async with session.get(
+                        server,
+                        params=retry_params,
+                        timeout=timeout,
+                    ) as response:
+                        data = await response.json(content_type=None)
+                    if "failed" in data:
+                        retry_failed_code = int(data["failed"])
+                        if retry_failed_code == 1 and data.get("ts"):
+                            self._longpoll_ts = str(data["ts"])
+                            return VKSyncResult(config.group_id, 0, 0, [], [])
+                        raise VKAPIError(
+                            "VK Long Poll failed after state refresh with code "
+                            f"{retry_failed_code}"
+                        )
+                else:
+                    await self._get_longpoll_state(client, config.group_id, force_refresh=True)
+                    raise VKAPIError(f"VK Long Poll failed with code {failed_code}")
 
         if data.get("ts"):
             self._longpoll_ts = str(data["ts"])
@@ -306,6 +339,8 @@ class VKService:
                 continue
             if isinstance(event_object.get("post"), dict):
                 event_object = event_object["post"]
+            elif isinstance(event_object.get("comment"), dict):
+                event_object = event_object["comment"]
             if event_type == "wall_post_new":
                 post, created = await self._save_post(source, event_object)
                 await self.repository.create_snapshot(post)
@@ -315,10 +350,21 @@ class VKService:
                 post_id = event_object.get("post_id")
                 if post_id is None:
                     continue
+                logger.info(
+                    "VK event received: type=wall_reply_new post_id=%s comment_id=%s",
+                    post_id,
+                    event_object.get("id"),
+                )
                 comment, created = await self._save_comment(
                     config.group_id,
                     int(post_id),
                     event_object,
+                )
+                logger.info(
+                    "VK comment saved: post_id=%s comment_id=%s created=%s",
+                    post_id,
+                    event_object.get("id"),
+                    created,
                 )
                 if created:
                     new_comments.append(comment)

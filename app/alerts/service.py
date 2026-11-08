@@ -171,6 +171,12 @@ class AlertService:
         )
 
     async def send_vk_comment_alert(self, comment: VkComment) -> None:
+        logger.info(
+            "VK comment alert requested: group_id=%s post_id=%s comment_id=%s",
+            comment.group_id,
+            comment.post_id,
+            comment.comment_id,
+        )
         if not await self._vk_alert_enabled("comment"):
             logger.info(
                 "VK comment alert skipped: disabled for group_id=%s post_id=%s comment_id=%s",
@@ -200,6 +206,8 @@ class AlertService:
         message: str,
     ) -> None:
         targets = self._alert_targets()
+        if platform == "vk":
+            logger.info("VK %s alert sending: targets=%s", item_type, len(targets))
         for chat_id in targets:
             try:
                 await self.bot.send_message(
