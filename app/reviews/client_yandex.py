@@ -11,6 +11,7 @@ import urllib.request
 from typing import Any
 
 from app.reviews.models import ReviewItem, ReviewPlatform, ReviewSource, ReviewSyncStatus
+from app.reviews.validation import review_date, review_rating
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +221,10 @@ class YandexReviewsClient:
                 assert self._opener is not None
                 with self._opener.open(api_req, timeout=self._timeout) as resp:
                     raw_body = resp.read().decode("utf-8")
+                    if "showcaptcha" in resp.geturl().lower() or (
+                        raw_body.lstrip().startswith("<") and "captcha" in raw_body.lower()
+                    ):
+                        return ReviewSyncStatus.CAPTCHA, [], "Captcha challenge encountered", 200
                     data = json.loads(raw_body)
                     if (
                         not isinstance(data, dict)
@@ -262,7 +267,7 @@ class YandexReviewsClient:
                                 200,
                             )
                         try:
-                            rating = int(raw_rating)
+                            rating = review_rating(raw_rating)
                         except (ValueError, TypeError):
                             return (
                                 ReviewSyncStatus.PARSER_FORMAT_CHANGED,
@@ -290,7 +295,11 @@ class YandexReviewsClient:
                                 f"Missing updatedTime for Yandex review {rev_id}",
                                 200,
                             )
-                        published_at = str(raw_updated).strip()
+                        try:
+                            published_at = review_date(raw_updated)
+                        except (ValueError, TypeError):
+                            return (ReviewSyncStatus.PARSER_FORMAT_CHANGED, [],
+                                    f"Invalid date for Yandex review {rev_id}", 200)
 
                         author = (
                             str(r.get("author", {}).get("name") or "Аноним").strip()

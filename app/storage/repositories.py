@@ -1749,6 +1749,23 @@ class ReviewRepository:
             ) as cursor:
                 if cursor.rowcount > 0:
                     inserted_count += 1
+                else:
+                    # Refresh edited public reviews without resetting delivery progress
+                    # or making historical imports produce notifications again.
+                    await connection.execute(
+                        """DELETE FROM review_analysis WHERE review_id IN (
+                           SELECT id FROM reviews WHERE platform=? AND external_review_id=?
+                           AND source_id=? AND (text IS NOT ? OR rating IS NOT ?))""",
+                        (platform_val, str(r.external_review_id), source_id, r.text, r.rating),
+                    )
+                    await connection.execute(
+                        """UPDATE reviews SET author_name=?,rating=?,text=?,published_at=?,
+                           edited_at=?,review_url=?,raw_payload_json=COALESCE(?,raw_payload_json),
+                           updated_at=? WHERE platform=? AND external_review_id=? AND source_id=?""",
+                        (r.author_name, r.rating, r.text, r.published_at, r.edited_at,
+                         r.review_url, r.raw_payload_json, now, platform_val,
+                         str(r.external_review_id), source_id),
+                    )
         await connection.commit()
         return inserted_count
 

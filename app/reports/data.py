@@ -109,34 +109,29 @@ def read_snapshot(path: Path, period: Period) -> dict:
         ]
         if len(reviews) > 500:
             raise ValueError("Найдено больше 500 отзывов. Выберите более короткий период.")
-        bounds = {
-            row["source_id"]: row["oldest"]
-            for row in connection.execute(
-                "SELECT source_id,MIN(julianday(published_at)) AS oldest "
-                "FROM reviews GROUP BY source_id"
-            )
-        }
-        start_jd = connection.execute(
-            "SELECT julianday(?)", (period.start.isoformat(),)
-        ).fetchone()[0]
         warnings = []
+        captured_at = datetime.now(UTC)
+        if period.end > captured_at:
+            warnings.append(
+                "Период включает незавершённый день: данные приведены на момент сбора; "
+                "позднее могут появиться новые отзывы."
+            )
         for source in sources:
             verified = connection.execute(
-                """SELECT 1 FROM review_history_coverage WHERE source_id=?
+                """SELECT checked_at FROM review_history_coverage WHERE source_id=?
                    AND julianday(period_start)<=julianday(?)
                    AND julianday(period_end)>=julianday(?)""",
                 (source["id"], period.start.isoformat(), period.end.isoformat()),
             ).fetchone()
-            source["coverage_complete"] = bool(
-                verified
-                or (source["is_initialized"] and bounds.get(source["id"], float("inf")) <= start_jd)
-            )
+            # Having one old record does not prove that intervening pages were read.
+            source["coverage_complete"] = bool(verified)
+            source["coverage_checked_at"] = verified[0] if verified else None
             if not source["coverage_complete"]:
                 warnings.append(
                     f"{source['platform']} / {source['branch_name']}: "
                     "история может не покрывать начало периода."
                 )
-            if source["last_error"]:
+            if source["last_error"] and not source["coverage_complete"]:
                 warnings.append(
                     f"{source['platform']} / {source['branch_name']}: источник имеет ошибку сбора."
                 )

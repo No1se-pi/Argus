@@ -167,6 +167,8 @@ class ActivityReportService:
                         "Подтверждена" if source["coverage_complete"] else "Не подтверждена",
                     ]
                 )
+                writer.writerow([section, "Время проверки выдачи UTC",
+                                 source.get("coverage_checked_at") or "Не проверена"])
                 writer.writerow(
                     [section, "Рейтинг на конец периода", source.get("rating_at_end") or "н/д"]
                 )

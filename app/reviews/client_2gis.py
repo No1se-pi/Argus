@@ -6,6 +6,7 @@ import urllib.parse
 import aiohttp
 
 from app.reviews.models import ReviewItem, ReviewPlatform, ReviewSource, ReviewSyncStatus
+from app.reviews.validation import review_date, review_rating
 
 logger = logging.getLogger(__name__)
 
@@ -165,9 +166,12 @@ class DGisReviewsClient:
                     next_link = meta.get("next_link")
                     cursor = None
                     if isinstance(next_link, str):
-                        parsed = urllib.parse.urlsplit(next_link)
+                        parsed = urllib.parse.urlsplit(urllib.parse.urljoin(api_base, next_link))
                         if parsed.netloc == "public-api.reviews.2gis.com" and parsed.path == urllib.parse.urlsplit(api_base).path:
                             cursor = urllib.parse.parse_qs(parsed.query).get("offset_date", [None])[0]
+                        if not cursor or (page > 1 and cursor == self._page_cursors[cursor_key]):
+                            return (ReviewSyncStatus.PARSER_FORMAT_CHANGED, [],
+                                    "Invalid or repeated 2GIS pagination cursor", 200, None, None)
                     self._page_cursors[(source.external_id, page_size, page+1)] = cursor
                     branch_rating = (
                         float(meta["branch_rating"])
@@ -212,7 +216,7 @@ class DGisReviewsClient:
                                 None,
                             )
                         try:
-                            rating = int(raw_rating)
+                            rating = review_rating(raw_rating)
                         except (ValueError, TypeError):
                             return (
                                 ReviewSyncStatus.PARSER_FORMAT_CHANGED,
@@ -246,7 +250,11 @@ class DGisReviewsClient:
                                 None,
                                 None,
                             )
-                        published_at = str(date_created).strip()
+                        try:
+                            published_at = review_date(date_created)
+                        except (ValueError, TypeError):
+                            return (ReviewSyncStatus.PARSER_FORMAT_CHANGED, [],
+                                    f"Invalid date for 2GIS review {rev_id}", 200, None, None)
                         edited_at = (
                             str(r.get("date_edited")).strip() if r.get("date_edited") else None
                         )
@@ -273,6 +281,7 @@ class DGisReviewsClient:
                                 published_at=published_at,
                                 edited_at=edited_at,
                                 review_url=rev_url,
+                                raw_payload_json=json.dumps(r, ensure_ascii=False),
                             )
                         )
 
