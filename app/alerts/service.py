@@ -11,9 +11,10 @@ from html import escape
 from typing import Any
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 
 from app.config import Settings
+from app.reviews.delivery import payload_dict
 from app.storage.models import (
     Post,
     Source,
@@ -441,6 +442,8 @@ class AlertService:
         )
         author = getattr(review, "author_name", "Аноним") or "Аноним"
         published_at = getattr(review, "published_at", "")
+        first_seen = getattr(review, "first_seen_at", None)
+        detected_line = f"<b>Обнаружен ботом (UTC):</b> {escape(first_seen)}\n" if first_seen else ""
         raw_text = getattr(review, "text", "") or "(без текста)"
         if raw_text.strip() == "TEXT_EMPTY":
             raw_text = "(без текста)"
@@ -454,7 +457,8 @@ class AlertService:
             f"<b>Учебное отделение:</b> {escape(branch_name)}\n"
             f"<b>Автор:</b> {escape(author)}\n"
             f"<b>Оценка:</b> {stars}\n"
-            f"<b>Дата:</b> {escape(published_at)}\n\n"
+            f"<b>Дата на площадке:</b> {escape(published_at)}\n"
+            f"{detected_line}\n"
             "<b>Текст:</b>\n"
         )
 
@@ -518,17 +522,16 @@ class AlertService:
                 )
             return False
 
+        payload = payload_dict(getattr(review, "raw_payload_json", None))
+        blocked_targets = payload.get("blocked_targets", {})
+        blocked_targets = blocked_targets if isinstance(blocked_targets, dict) else {}
+        sent_at_by_target = payload.get("target_sent_at", {})
+        sent_at_by_target = sent_at_by_target if isinstance(sent_at_by_target, dict) else {}
         target_progress: dict[str, int] = {}
-        if hasattr(review, "raw_payload_json") and review.raw_payload_json:
+        if isinstance(payload.get("targets"), dict):
             try:
-                payload = json.loads(review.raw_payload_json)
-                if (
-                    isinstance(payload, dict)
-                    and "targets" in payload
-                    and isinstance(payload["targets"], dict)
-                ):
-                    target_progress = {str(k): int(v) for k, v in payload["targets"].items()}
-            except Exception:
+                target_progress = {str(k): int(v) for k, v in payload["targets"].items()}
+            except (ValueError, TypeError):
                 pass
 
         default_sent = getattr(review, "telegram_parts_sent", 0)
@@ -545,10 +548,15 @@ class AlertService:
 
         first_exception: Exception | None = None
 
+        def delivery_payload():
+            payload.update(targets=target_progress, blocked_targets=blocked_targets,
+                           target_sent_at=sent_at_by_target)
+            return json.dumps(payload, ensure_ascii=False)
+
         for chat_id in targets:
             chat_str = str(chat_id)
             current_sent = target_progress.get(chat_str, 0)
-            if current_sent >= total_parts:
+            if current_sent >= total_parts or chat_str in blocked_targets:
                 continue
 
             for part_idx in range(current_sent, total_parts):
@@ -560,10 +568,12 @@ class AlertService:
                         disable_web_page_preview=True,
                     )
                     target_progress[chat_str] = part_idx + 1
+                    if part_idx + 1 == total_parts:
+                        sent_at_by_target[chat_str] = datetime.now(UTC).isoformat()
                     min_parts_sent = min(
                         (target_progress.get(str(t), 0) for t in targets), default=0
                     )
-                    payload_json = json.dumps({"targets": target_progress})
+                    payload_json = delivery_payload()
                     if hasattr(review, "raw_payload_json"):
                         review.raw_payload_json = payload_json
                     if hasattr(review, "telegram_parts_sent"):
@@ -577,6 +587,13 @@ class AlertService:
                             error=None,
                             raw_payload_json=payload_json,
                         )
+                    if part_idx + 1 == total_parts:
+                        await self.alerts.create_platform_alert(
+                            platform=platform_str, source_id=None, item_type="review",
+                            item_id=rev_id_str, alert_type="new_review", chat_id=chat_id,
+                            message=chunks[0] if chunks else "", status="sent",
+                            sent_at=sent_at_by_target[chat_str],
+                        )
                 except Exception as exc:
                     logger.warning(
                         "Failed to send review alert part %d to chat %s: %s",
@@ -586,6 +603,8 @@ class AlertService:
                     )
                     if first_exception is None:
                         first_exception = exc
+                    if isinstance(exc, TelegramForbiddenError):
+                        blocked_targets[chat_str] = "forbidden"
                     await self.alerts.create_platform_alert(
                         platform=platform_str,
                         source_id=None,
@@ -594,16 +613,17 @@ class AlertService:
                         alert_type="new_review",
                         chat_id=chat_id,
                         message=chunk_text,
-                        status="failed",
+                        status="blocked" if isinstance(exc, TelegramForbiddenError) else "failed",
                         sent_at=None,
                     )
                     break
 
         min_parts_sent = min((target_progress.get(str(t), 0) for t in targets), default=0)
         all_completed = bool(targets) and all(
-            target_progress.get(str(t), 0) >= total_parts for t in targets
+            target_progress.get(str(t), 0) >= total_parts or str(t) in blocked_targets
+            for t in targets
         )
-        payload_json = json.dumps({"targets": target_progress})
+        payload_json = delivery_payload()
         if hasattr(review, "raw_payload_json"):
             review.raw_payload_json = payload_json
         if hasattr(review, "telegram_parts_sent"):
@@ -620,19 +640,7 @@ class AlertService:
             )
 
         if all_completed:
-            for chat_id in targets:
-                await self.alerts.create_platform_alert(
-                    platform=platform_str,
-                    source_id=None,
-                    item_type="review",
-                    item_id=rev_id_str,
-                    alert_type="new_review",
-                    chat_id=chat_id,
-                    message=chunks[0] if chunks else "",
-                    status="sent",
-                    sent_at=datetime.now(UTC).isoformat(),
-                )
-            return True
+            return any(target_progress.get(str(t), 0) >= total_parts for t in targets)
 
         if first_exception:
             raise first_exception

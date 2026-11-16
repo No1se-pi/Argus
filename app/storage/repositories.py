@@ -9,6 +9,7 @@ except ImportError:
 
 from app.analytics.dashboard import DashboardService
 from app.reviews.models import ReviewItem, ReviewPlatform, ReviewSource
+from app.reviews.delivery import refreshed_payload
 from app.storage.database import Database
 from app.time import resolve_timezone
 from app.storage.models import (
@@ -1545,6 +1546,7 @@ class ReviewRepository:
             else None,
             sentiment=row["sentiment"] if "sentiment" in row.keys() else None,
             analysis_reason=row["analysis_reason"] if "analysis_reason" in row.keys() else None,
+            first_seen_at=row["first_seen_at"] if "first_seen_at" in row.keys() else None,
         )
 
     async def ensure_default_sources(self, sources: list[dict]) -> int:
@@ -1752,6 +1754,15 @@ class ReviewRepository:
                 else:
                     # Refresh edited public reviews without resetting delivery progress
                     # or making historical imports produce notifications again.
+                    async with connection.execute(
+                        """SELECT raw_payload_json FROM reviews WHERE platform=?
+                           AND external_review_id=? AND source_id=?""",
+                        (platform_val, str(r.external_review_id), source_id),
+                    ) as existing_cursor:
+                        existing_row = await existing_cursor.fetchone()
+                    payload = refreshed_payload(
+                        r.raw_payload_json, existing_row[0] if existing_row else None
+                    )
                     await connection.execute(
                         """DELETE FROM review_analysis WHERE review_id IN (
                            SELECT id FROM reviews WHERE platform=? AND external_review_id=?
@@ -1763,7 +1774,7 @@ class ReviewRepository:
                            edited_at=?,review_url=?,raw_payload_json=COALESCE(?,raw_payload_json),
                            updated_at=? WHERE platform=? AND external_review_id=? AND source_id=?""",
                         (r.author_name, r.rating, r.text, r.published_at, r.edited_at,
-                         r.review_url, r.raw_payload_json, now, platform_val,
+                         r.review_url, payload, now, platform_val,
                          str(r.external_review_id), source_id),
                     )
         await connection.commit()

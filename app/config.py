@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     enable_telegram_monitor: bool = False
     enable_reviews_monitor: bool = False
 
-    reviews_poll_interval_seconds: int = 900
+    reviews_poll_interval_seconds: int = 180
     reviews_request_pause_seconds: float = 3.0
     reviews_fetch_page_size: int = 10
     reviews_max_catchup_reviews: int = 50

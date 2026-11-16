@@ -54,6 +54,7 @@ class ReviewItem:
     last_delivery_error: str | None = None
     sentiment: str | None = None
     analysis_reason: str | None = None
+    first_seen_at: str | None = None
 
     @property
     def is_empty_text(self) -> bool:

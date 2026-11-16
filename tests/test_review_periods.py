@@ -108,3 +108,79 @@ async def test_transient_failure_retries_but_challenges_stop(store, monkeypatch,
         notify_since=None, settings=SimpleNamespace(reviews_request_pause_seconds=0)))
     assert await loader._load(client, source, Period.parse("09.11.2026 16.11.2026")) is complete
     assert client.fetch_reviews.await_count == calls
+
+
+@pytest.mark.asyncio
+async def test_report_refresh_preserves_partial_delivery_and_public_payload(store):
+    import json
+    from unittest.mock import MagicMock
+
+    from aiogram.exceptions import TelegramAPIError
+
+    from app.alerts.service import AlertService
+    from app.config import Settings
+
+    _, repos, source = store
+    item = replace(review(source, "partial", "2026-11-13T12:00:00Z"),
+                   raw_payload_json='{"public":"original"}')
+    await repos.reviews.save_reviews([item], source.id)
+    attempts = []
+
+    async def send(chat_id, **kwargs):
+        attempts.append(chat_id)
+        if chat_id == 222 and attempts.count(222) == 1:
+            raise TelegramAPIError(method=MagicMock(), message="Temporary failure")
+
+    alerts = AlertService(bot=SimpleNamespace(send_message=send),
+        settings=Settings(_env_file=None, bot_token="123456:TEST", ADMIN_IDS="111,222"),
+        alerts=repos.alerts, runtime_settings=repos.runtime_settings)
+    saved = (await repos.reviews.get_recent_reviews(1))[0]
+    with pytest.raises(TelegramAPIError):
+        await alerts.send_review_alert(saved, source, repos.reviews)
+    # Reproduce the exact report-triggered duplicate: a public JSON refresh arrives
+    # while one recipient already has the alert and another is still pending.
+    refreshed = replace(item, raw_payload_json='{"public":"refreshed"}')
+    await repos.reviews.save_reviews([refreshed], source.id, mark_sent=True)
+    saved = (await repos.reviews.get_recent_reviews(1))[0]
+    payload = json.loads(saved.raw_payload_json)
+    assert payload["targets"] == {"111": 1, "222": 0}
+    assert payload["public"] == "refreshed" and saved.first_seen_at
+    assert await alerts.send_review_alert(saved, source, repos.reviews)
+    assert sorted(attempts) == [111, 222, 222]
+    saved = (await repos.reviews.get_recent_reviews(1))[0]
+    payload = json.loads(saved.raw_payload_json)
+    assert set(payload["target_sent_at"]) == {"111", "222"}
+    assert payload["public"] == "refreshed"
+
+
+@pytest.mark.asyncio
+async def test_blocked_recipient_is_terminal_and_never_blocks_other_targets(store):
+    import json
+    from unittest.mock import MagicMock
+
+    from aiogram.exceptions import TelegramForbiddenError
+
+    from app.alerts.service import AlertService
+    from app.config import Settings
+
+    _, repos, source = store
+    await repos.reviews.save_reviews([review(source, "blocked", "2026-11-13T12:00:00Z")],
+                                    source.id)
+    attempts = []
+
+    async def send(chat_id, **kwargs):
+        attempts.append(chat_id)
+        if chat_id == 111:
+            raise TelegramForbiddenError(method=MagicMock(), message="Bot was blocked")
+
+    alerts = AlertService(bot=SimpleNamespace(send_message=send),
+        settings=Settings(_env_file=None, bot_token="123456:TEST", ADMIN_IDS="111,222"),
+        alerts=repos.alerts, runtime_settings=repos.runtime_settings)
+    saved = (await repos.reviews.get_recent_reviews(1))[0]
+    assert await alerts.send_review_alert(saved, source, repos.reviews)
+    saved = (await repos.reviews.get_recent_reviews(1))[0]
+    assert json.loads(saved.raw_payload_json)["blocked_targets"] == {"111": "forbidden"}
+    assert saved.is_sent_to_telegram
+    assert not await repos.reviews.get_unsent_reviews()
+    assert await alerts.send_review_alert(saved, source, repos.reviews)
+    assert sorted(attempts) == [111, 222]
