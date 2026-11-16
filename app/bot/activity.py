@@ -51,6 +51,7 @@ def keyboard(export_id: str | None = None):
                 InlineKeyboardButton(text="30 дней", callback_data="activity:30d"),
             ],
             [
+                InlineKeyboardButton(text="🔐 Подключить ВК", callback_data="vklui:connect"),
                 InlineKeyboardButton(text="📎 Шаблон", callback_data="vklui:template"),
                 InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"),
             ],
@@ -88,11 +89,11 @@ async def generate(message, value, service):
         await message.answer(escape(str(exc)), reply_markup=keyboard())
         return
     await message.answer(
-        "Проверяю историю отзывов и готовлю полную презентацию. Новый сбор ВК не запускается. "
-        "Дозагрузка истории может занять несколько минут."
+        "Собираю свежие лайки ВК и отзывы Яндекса/2ГИС за выбранные даты, "
+        "затем подготовлю полную презентацию. Это может занять несколько минут."
     )
     try:
-        result = await service.generate(period)
+        result = await service.generate(period, collect_vk=True)
     except ValueError as exc:
         await message.answer(escape(str(exc)), reply_markup=keyboard())
         return
@@ -109,6 +110,8 @@ async def generate(message, value, service):
         if result.warnings
         else ""
     )
+    if getattr(result, "vk_error", None):
+        warning += f"\n\n⚠️ Лайки ВК — н/д: {escape(result.vk_error)}"
     await message.answer(
         f"Готово: {result.slides} слайдов, {result.reviews} отзывов, "
         f"постов ВК: {result.posts if result.posts is not None else 'н/д'}.{warning}",
@@ -143,7 +146,8 @@ async def activity_menu(query: CallbackQuery, state: FSMContext):
         await query.message.answer(
             "<b>📑 Полная презентация</b>\n\n"
             "Отзывы всех тональностей, сводки по отделениям, рейтинги, лайки и критические случаи. "
-            "ФИО остаются как в исходном шаблоне. Выберите период.",
+            "После выбора периода бот сам соберёт лайки и отзывы. "
+            "ФИО остаются как в исходном шаблоне.",
             reply_markup=keyboard(),
         )
 

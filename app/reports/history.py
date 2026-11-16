@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 class HistoricalReviewsLoader:
     def __init__(self, reviews_service):
         self.service = reviews_service
+        self.observed: dict[int, set[str]] = {}
 
     async def ensure(self, period: Period, sources: list[dict]) -> list[str]:
         # Do not interleave history pagination and the live monitor's database work.
@@ -24,6 +25,7 @@ class HistoricalReviewsLoader:
             return await self._ensure(period, sources)
 
     async def _ensure(self, period: Period, sources: list[dict]) -> list[str]:
+        self.observed = {}
         service = self.service
         proxy = service.settings.reviews_proxy_url
         proxy = proxy.get_secret_value() if proxy else None
@@ -71,6 +73,7 @@ class HistoricalReviewsLoader:
 
     async def _load(self, client, source: ReviewSource, period: Period) -> bool:
         seen = set()
+        self.observed[source.id] = seen
         page_size = 50
         quiet_before = self.service.notify_since or datetime.now(UTC)
         complete = False

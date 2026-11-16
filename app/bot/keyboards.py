@@ -4,6 +4,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📑 Полная презентация", callback_data="activity:menu")],
             [InlineKeyboardButton(text="❤️ Лайки и презентации ВК", callback_data="vkl:menu")],
             [
                 InlineKeyboardButton(text="📊 Дашборды", callback_data="menu:dash"),

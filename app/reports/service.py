@@ -1,9 +1,10 @@
-"""Build a complete activity deck from saved evidence; never trigger VK collection."""
+"""Collect an explicit period on demand and build a complete activity deck."""
 
 import asyncio
 import csv
 import io
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,10 @@ from app.reports.history import HistoricalReviewsLoader
 from app.reports.identities import identity_csv
 from app.reports.pptx import Slide, TemplateDeck
 from app.reports.render import RenderedPage, ReportRenderer
+from app.vk.client import VKAPIError, vk_error_text
+from app.vk.likes import LikesSelection
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -24,6 +29,7 @@ class ActivityExport:
     reviews: int
     posts: int | None
     warnings: tuple[str, ...]
+    vk_error: str | None = None
 
 
 def reviews_csv(snapshot: dict) -> bytes:
@@ -66,13 +72,29 @@ class ActivityReportService:
         )
         self.reviews_service = reviews_service
 
-    async def generate(self, period: Period) -> ActivityExport:
+    async def generate(self, period: Period, *, collect_vk: bool = False) -> ActivityExport:
         if self._lock.locked():
             raise ValueError("Презентация уже формируется. Дождитесь завершения текущей задачи.")
         async with self._lock:
             template = await self.workspace.template()
             if template is None:
                 raise ValueError("Сначала загрузите исходный PPTX в меню ВК → Шаблон презентации.")
+            vk_error = None
+            fresh_vk = None
+            if collect_vk:
+                try:
+                    fresh_vk = await self.workspace.service.collect(
+                        LikesSelection(label=period.label, start=period.start, end=period.end)
+                    )
+                except VKAPIError as exc:
+                    vk_error = vk_error_text(exc)
+                    logger.warning("Activity VK collection failed method=%s code=%s",
+                                   exc.method, exc.code)
+                except ValueError as exc:
+                    vk_error = str(exc)
+                except Exception as exc:
+                    logger.warning("Activity VK collection failed error=%s", type(exc).__name__)
+                    vk_error = "Не удалось связаться с ВК. Проверьте подключение и повторите сбор."
             if self.reviews_service is not None:
                 await self.reviews_service.ensure_default_sources()
             snapshot = await asyncio.to_thread(read_snapshot, self.database.path, period)
@@ -80,6 +102,29 @@ class ActivityReportService:
                 warnings = await self.history.ensure(period, snapshot["sources"])
                 snapshot = await asyncio.to_thread(read_snapshot, self.database.path, period)
                 snapshot["warnings"].extend(warnings)
+                complete = {source["id"] for source in snapshot["sources"]
+                            if source["coverage_complete"]}
+                # Retain archived records in SQLite, but do not publish disappeared reviews
+                # as if they were present in the just-verified public listing.
+                previous_count = len(snapshot["reviews"])
+                snapshot["reviews"] = [
+                    item for item in snapshot["reviews"]
+                    if item["source_id"] not in complete
+                    or item["external_review_id"] in self.history.observed.get(
+                        item["source_id"], set()
+                    )
+                ]
+                snapshot["excluded_cached_reviews"] = previous_count - len(snapshot["reviews"])
+            if collect_vk:
+                # Use this run's result, never a stale report after a failed fresh request.
+                snapshot["warnings"] = [
+                    warning for warning in snapshot["warnings"]
+                    if not warning.startswith(("ВК:", "Нет сохранённого сбора ВК"))
+                ]
+                snapshot["vk"] = fresh_vk
+                snapshot["vk_collection_error"] = vk_error
+                if vk_error:
+                    snapshot["warnings"].append(f"Свежие лайки ВК не собраны: {vk_error}")
             return await self.generate_snapshot(template, snapshot)
 
     async def generate_snapshot(self, template: bytes, snapshot: dict) -> ActivityExport:
@@ -158,6 +203,8 @@ class ActivityReportService:
             writer = csv.writer(checks, delimiter=";")
             writer.writerow(["Раздел", "Проверка", "Результат"])
             writer.writerow(["Период", "Оба дня включены", snapshot["period"]])
+            writer.writerow(["Архив", "Старые записи, не найденные в проверенной выдаче",
+                             snapshot.get("excluded_cached_reviews", 0)])
             for source in snapshot["sources"]:
                 section = f"{source['platform']} / {source['branch_name']}"
                 writer.writerow(
@@ -217,4 +264,5 @@ class ActivityReportService:
             len(snapshot["reviews"]),
             snapshot["vk"]["posts_count"] if snapshot["vk"] else None,
             tuple(snapshot["warnings"]),
+            snapshot.get("vk_collection_error"),
         )

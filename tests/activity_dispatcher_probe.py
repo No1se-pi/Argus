@@ -111,6 +111,7 @@ async def main():
     assert not [call for call, _ in session.calls if call.__api_method__ == "sendDocument"]
     await message(42)
     service.generate.assert_awaited_once()
+    assert service.generate.await_args.kwargs == {"collect_vk": True}
     assert len([call for call, _ in session.calls if call.__api_method__ == "sendDocument"]) == 2
     await click(42, "activity:retry:" + directory.name)
     assert len([call for call, _ in session.calls if call.__api_method__ == "sendDocument"]) == 4
