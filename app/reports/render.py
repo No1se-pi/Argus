@@ -51,18 +51,18 @@ body{font-family:Arial,'Liberation Sans',sans-serif;color:#242528}
 .footer{position:absolute;bottom:1px;right:18px;font-size:21px;font-weight:700;color:#777}
 .rating-top{display:flex;align-items:center;justify-content:space-between;
 width:1320px;margin:0 auto 14px;padding:8px 10px 0;min-height:48px}
-.rating-note{font-size:23px;color:#3f3175;font-weight:700}
+.rating-note{font-size:25px;color:#3f3175;font-weight:700}
 .platform-logo{width:145px;height:34px;object-fit:contain}
 .rating-panel{width:1320px;margin:auto;display:grid;grid-template-columns:1fr 1fr;gap:15px}
 .rating-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:18px;
-min-height:150px;padding:17px 24px;border:1px solid #dce1ef;border-radius:15px;background:#fff}
+min-height:163px;padding:17px 24px;border:1px solid #dce1ef;border-radius:15px;background:#fff}
 .rating-panel.dgis .rating-row{border-color:#d7e7dc}
-.rating-logo{width:145px;height:15px;object-fit:contain;object-position:left;margin-bottom:6px}
-.rating-branch{font-size:23px;line-height:28px;color:#24345a;font-weight:bold}
-.rating-address{font-size:16px;line-height:22px;color:#575f6e;margin-top:6px}
-.score{text-align:right;min-width:202px}.score-value{font-size:38px;font-weight:700;color:#242947}
-.star{color:#e9a416}.volume{display:block;font-size:15px;color:#575f6e;margin:0 0 4px}
-.delta{display:inline-block;font-size:17px;font-weight:700;padding:4px 9px;
+.rating-logo{width:165px;height:18px;object-fit:contain;object-position:left;margin-bottom:6px}
+.rating-branch{font-size:25px;line-height:30px;color:#24345a;font-weight:bold}
+.rating-address{font-size:20px;line-height:25px;color:#575f6e;margin-top:6px}
+.score{text-align:right;min-width:202px}.score-value{font-size:43px;font-weight:700;color:#242947}
+.star{color:#e9a416}.volume{display:block;font-size:18px;color:#575f6e;margin:0 0 4px}
+.delta{display:inline-block;font-size:20px;font-weight:700;padding:4px 9px;
 border-radius:6px;background:#f0f1f5;color:#454a60}
 .delta.up{color:#137246;background:#e4f4e9}.delta.down{color:#a22538;background:#fae8ec}
 .verified-owner{display:inline-flex;align-items:center;justify-content:center;
