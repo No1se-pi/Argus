@@ -1,6 +1,7 @@
 """Admin-only full presentation workflow and retry of already generated files."""
 
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime, timedelta
@@ -8,38 +9,44 @@ from html import escape
 
 import aiohttp
 from aiogram import F, Router
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramNetworkError, TelegramServerError
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
-    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
 
-from app.bot.files import send_file
+from app.bot.files import FILE_TIMEOUT, ReportInputFile, send_file
 from app.reports.data import Period
+from app.reports.pptx import report_title
 from app.reports.service import ActivityReportService
 from app.time import resolve_timezone
+from app.vk.client import VKAPIError, vk_error_text
 
 logger = logging.getLogger(__name__)
 router = Router(name="activity_reports")
+NETWORK_ERRORS = (TelegramNetworkError, TelegramServerError, aiohttp.ClientError, asyncio.TimeoutError)
+NOTICE_TIMEOUT = 10
 
 
 class ActivityStates(StatesGroup):
     waiting_period = State()
 
 
-def keyboard(export_id: str | None = None):
+def keyboard(export_id: str | None = None, retry_file: str | None = None):
     rows = []
     if export_id:
+        callback = f"activity:retry:{export_id}"
+        if retry_file:
+            callback += f":{retry_file}"
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="📤 Повторить отправку", callback_data=f"activity:retry:{export_id}"
+                    text="📤 Повторить отправку", callback_data=callback
                 )
             ]
         )
@@ -60,22 +67,67 @@ def keyboard(export_id: str | None = None):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def deliver(message, directory):
+async def report_notice(message, text, **kwargs):
     try:
-        await send_file(
-            message,
-            FSInputFile(directory / "activity.pptx"),
-            caption="Презентация по выбранному периоду",
-        )
-        await send_file(
-            message,
-            FSInputFile(directory / "audit.zip"),
-            caption="Сверка данных, совпадения ФИО, предположения и ограничения полноты.",
-        )
-    except (TelegramNetworkError, aiohttp.ClientError, asyncio.TimeoutError):
-        await message.answer(
-            "Файлы сохранены, но Telegram не подтвердил передачу. Можно повторить отправку.",
-            reply_markup=keyboard(directory.name),
+        await message.bot(message.answer(text, **kwargs), request_timeout=NOTICE_TIMEOUT)
+    except NETWORK_ERRORS as exc:
+        logger.warning("Activity report notice failed error=%s", type(exc).__name__)
+
+
+async def deliver(message, directory, only_file=None):
+    filename = "activity.pptx"
+    try:
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        period = manifest.get("period", "")
+        if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}–\d{2}\.\d{2}\.\d{4}", period):
+            filename = report_title(period) + ".pptx"
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    documents = (
+        ("pptx", "activity.pptx", filename, "Презентация по выбранному периоду"),
+        ("audit", "audit.zip", "audit.zip", "Сверка данных и ограничения полноты."),
+    )
+    failed = []
+    for kind, basename, display_name, caption in documents:
+        if only_file is not None and only_file != kind:
+            continue
+        path = directory / basename
+        if not path.is_file():
+            logger.error("Activity report file missing export=%s file=%s", directory.name, basename)
+            failed.append(kind)
+            continue
+        # Allow a slow transfer, but abandon a stalled first connection in time to retry.
+        first_timeout = min(FILE_TIMEOUT, max(30, path.stat().st_size // (64 * 1024) + 15))
+        for attempt, timeout in enumerate((first_timeout, FILE_TIMEOUT), start=1):
+            try:
+                await send_file(
+                    message,
+                    ReportInputFile(path, filename=display_name),
+                    caption=caption,
+                    request_timeout=timeout,
+                )
+            except NETWORK_ERRORS as exc:
+                logger.warning(
+                    "Activity report transfer failed export=%s file=%s attempt=%s error=%s cause=%s",
+                    directory.name, basename, attempt, type(exc).__name__,
+                    type(exc.__cause__).__name__,
+                )
+            else:
+                logger.info("Activity report sent export=%s file=%s", directory.name, basename)
+                break
+        else:
+            failed.append(kind)
+    if failed:
+        retry_file = failed[0] if len(failed) == 1 else None
+        if retry_file == "pptx":
+            status = "Telegram не подтвердил отправку презентации."
+        elif retry_file == "audit":
+            status = "Telegram не подтвердил отправку архива сверки."
+        else:
+            status = "Telegram не подтвердил отправку презентации и архива."
+        await report_notice(
+            message, status + " Файлы сохранены. Можно повторить отправку.",
+            reply_markup=keyboard(directory.name, retry_file),
         )
 
 
@@ -88,7 +140,26 @@ async def generate(message, value, service):
     except ValueError as exc:
         await message.answer(escape(str(exc)), reply_markup=keyboard())
         return
-    await message.answer(
+    try:
+        await asyncio.wait_for(service.check_vk_access(), timeout=12)
+    except VKAPIError as exc:
+        await report_notice(
+            message,
+            f"{escape(vk_error_text(exc))}\nПосле подключения заново выберите период.",
+            reply_markup=keyboard(),
+        )
+        return
+    except ValueError as exc:
+        await report_notice(message, escape(str(exc)), reply_markup=keyboard())
+        return
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        await report_notice(
+            message, "ВК не ответил на проверку доступа. Повторите попытку.",
+            reply_markup=keyboard(),
+        )
+        return
+    await report_notice(
+        message,
         "Собираю свежие лайки ВК и отзывы Яндекса/2ГИС за выбранные даты, "
         "затем подготовлю полную презентацию. Это может занять несколько минут."
     )
@@ -112,7 +183,8 @@ async def generate(message, value, service):
     )
     if getattr(result, "vk_error", None):
         warning += f"\n\n⚠️ Лайки ВК — н/д: {escape(result.vk_error)}"
-    await message.answer(
+    await report_notice(
+        message,
         f"Готово: {result.slides} слайдов, {result.reviews} отзывов, "
         f"постов ВК: {result.posts if result.posts is not None else 'н/д'}.{warning}",
         reply_markup=keyboard(result.directory.name),
@@ -134,6 +206,10 @@ async def activity_command(
             "Укажите период: /activity_pptx 12.10.2026 19.10.2026",
             reply_markup=keyboard(),
         )
+        return
+    retry = re.fullmatch(r"retry\s+([a-f0-9]{32})(?:\s+(pptx|audit))?", command.args.strip())
+    if retry is not None and activity_report_service is not None:
+        await retry_export(message, activity_report_service, *retry.groups())
         return
     await generate(message, command.args, activity_report_service)
 
@@ -199,14 +275,21 @@ async def activity_recent(
 async def activity_retry(
     query: CallbackQuery, activity_report_service: ActivityReportService | None = None
 ):
-    await query.answer()
+    try:
+        await query.bot(query.answer(), request_timeout=NOTICE_TIMEOUT)
+    except NETWORK_ERRORS as exc:
+        logger.warning("Activity report retry acknowledgment failed error=%s", type(exc).__name__)
     if not isinstance(query.message, Message) or activity_report_service is None:
         return
-    identity = query.data.rsplit(":", 1)[-1]
-    if not re.fullmatch("[a-f0-9]{32}", identity):
+    match = re.fullmatch(r"activity:retry:([a-f0-9]{32})(?::(pptx|audit))?", query.data)
+    if match is None:
         return
-    directory = activity_report_service.database.path.parent / "exports" / "activity" / identity
+    await retry_export(query.message, activity_report_service, *match.groups())
+
+
+async def retry_export(message, service, identity, only_file=None):
+    directory = service.database.path.parent / "exports" / "activity" / identity
     if not (directory / "manifest.json").is_file():
-        await query.message.answer("Сохранённая презентация не найдена.", reply_markup=keyboard())
+        await report_notice(message, "Сохранённая презентация не найдена.", reply_markup=keyboard())
         return
-    await deliver(query.message, directory)
+    await deliver(message, directory, only_file)

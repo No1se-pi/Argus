@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.types import Chat, Message, Update
 
 from app.bot.factory import create_dispatcher
@@ -22,12 +23,22 @@ class Session(BaseSession):
     def __init__(self):
         super().__init__()
         self.calls = []
+        self.drop_ready = False
+        self.fail_documents = {}
 
     async def close(self):
         pass
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append((method, timeout))
+        if method.__api_method__ == "sendMessage" and method.text.startswith("Готово"):
+            if self.drop_ready:
+                raise TelegramNetworkError(method=method, message="Ready notice timed out")
+        if method.__api_method__ == "sendDocument":
+            filename = Path(method.document.path).name
+            if self.fail_documents.get(filename, 0):
+                self.fail_documents[filename] -= 1
+                raise TelegramNetworkError(method=method, message="Upload timed out")
         return Message(
             message_id=len(self.calls),
             date=datetime.now(timezone.utc),
@@ -50,6 +61,7 @@ async def main():
     service = SimpleNamespace(
         database=SimpleNamespace(path=root / "argus.sqlite3"),
         timezone_name="Europe/Moscow",
+        check_vk_access=AsyncMock(),
         generate=AsyncMock(
             return_value=SimpleNamespace(
                 directory=directory, slides=29, reviews=50, posts=17, warnings=()
@@ -62,7 +74,7 @@ async def main():
     bot = Bot(token="123456:TEST_ONLY", session=session)
     sequence = 0
 
-    async def message(user):
+    async def message(user, text="/activity_pptx 12.10.2026 19.10.2026"):
         nonlocal sequence
         sequence += 1
         await dispatcher.feed_update(
@@ -75,7 +87,7 @@ async def main():
                         "date": 1794014400,
                         "chat": {"id": 42, "type": "private"},
                         "from": {"id": user, "is_bot": False, "first_name": "Admin"},
-                        "text": "/activity_pptx 12.10.2026 19.10.2026",
+                        "text": text,
                     },
                 }
             ),
@@ -119,8 +131,47 @@ async def main():
     await click(42, "activity:retry:../../secrets")
     assert len([call for call, _ in session.calls if call.__api_method__ == "sendDocument"]) == 4
     assert all(
-        timeout == 300 for call, timeout in session.calls if call.__api_method__ == "sendDocument"
+        timeout == 30 for call, timeout in session.calls if call.__api_method__ == "sendDocument"
     )
+    session.calls.clear()
+    session.drop_ready = True
+    session.fail_documents = {"activity.pptx": 1, "audit.zip": 2}
+    await message(42)
+    transfers = [
+        (Path(call.document.path).name, timeout) for call, timeout in session.calls
+        if call.__api_method__ == "sendDocument"
+    ]
+    assert transfers == [
+        ("activity.pptx", 30), ("activity.pptx", 300), ("audit.zip", 30), ("audit.zip", 300),
+    ]
+    retry_notice = next(call for call, _ in session.calls
+                        if call.__api_method__ == "sendMessage" and "архива сверки" in call.text)
+    retry = retry_notice.reply_markup.inline_keyboard[0][0].callback_data
+    assert retry == "activity:retry:" + directory.name + ":audit"
+    session.calls.clear()
+    await click(42, retry)
+    assert [Path(call.document.path).name for call, _ in session.calls
+            if call.__api_method__ == "sendDocument"] == ["audit.zip"]
+    assert service.generate.await_count == 2
+    session.calls.clear()
+    retry_command = f"/activity_pptx retry {directory.name} pptx"
+    await message(43, retry_command)
+    assert not [call for call, _ in session.calls if call.__api_method__ == "sendDocument"]
+    await message(42, retry_command)
+    assert [Path(call.document.path).name for call, _ in session.calls
+            if call.__api_method__ == "sendDocument"] == ["activity.pptx"]
+    assert service.generate.await_count == 2
+    from app.vk.client import VKAPIError
+    session.calls.clear()
+    service.check_vk_access.side_effect = VKAPIError(
+        "Access token expired", code=5, method="wall.get",
+    )
+    await message(42)
+    assert service.generate.await_count == 2
+    notice = next(call for call, _ in session.calls if call.__api_method__ == "sendMessage")
+    assert "истёк" in notice.text
+    assert any(button.callback_data == "vklui:connect"
+               for row in notice.reply_markup.inline_keyboard for button in row)
     await click(42, "activity:custom")
     state = dispatcher.fsm.get_context(bot=bot, chat_id=42, user_id=42)
     assert await state.get_state()

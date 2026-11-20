@@ -60,6 +60,7 @@ class YandexReviewsClient:
         self._base_origin: str = "https://yandex.ru"
         self._metadata_business_id: str | None = None
         self._metadata_at = 0.0
+        self.last_verified_owner: bool | None = None
         self.last_rating: float | None = None
         self.last_total_count: int | None = None
 
@@ -79,7 +80,7 @@ class YandexReviewsClient:
         source: ReviewSource,
     ) -> tuple[ReviewSyncStatus, str | None, int | None]:
         opener = self._create_opener()
-        self.last_rating = self.last_total_count = None
+        self.last_rating = self.last_total_count = self.last_verified_owner = None
         try:
             page_req = urllib.request.Request(
                 source.url,
@@ -158,6 +159,9 @@ class YandexReviewsClient:
             candidate = None
             if any(str(node.get(key,"")) == business_id for key in ("id","oid","businessId")):
                 candidate = node.get("ratingData") or node.get("aggregateRating")
+                properties = node.get("businessProperties")
+                if isinstance(properties, dict) and type(properties.get("has_verified_owner")) is bool:
+                    self.last_verified_owner = properties["has_verified_owner"]
             elif (isinstance(node.get("@type"),str) and node.get("@type") in {"Organization","LocalBusiness","CollegeOrUniversity","EducationalOrganization"}
                   and business_id in str(node.get("url", ""))+str(node.get("@id", ""))):
                 candidate = node.get("aggregateRating")

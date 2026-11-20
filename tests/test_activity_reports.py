@@ -1,4 +1,5 @@
 import io
+import json
 from datetime import datetime
 from zipfile import ZipFile
 
@@ -9,6 +10,7 @@ from app.reports.data import Period, select_vk_report
 from app.reports.identities import suggestions
 from app.reports.pptx import CT, REL, A, P, R, Slide, TemplateDeck
 from app.reports.render import RenderedPage, review_card
+from app.reports.review_details import is_negative, review_details
 from app.reviews.client_2gis import DGisReviewsClient
 from app.reviews.client_yandex import YandexReviewsClient
 from app.reviews.models import ReviewPlatform, ReviewSource
@@ -91,6 +93,53 @@ def test_html_preserves_stars_and_escapes_untrusted_text():
     assert "★★<span class='empty'>★★★</span>" in card
     assert "12.10.2026" in card
     assert "★" not in review_card({"rating": None}, "Europe/Moscow")
+
+
+def test_comparison_matches_the_previous_calendar_week_across_dst():
+    period = Period.parse("26.10.2026 01.11.2026", "Europe/Berlin")
+    assert period.comparison_start.isoformat() == "2026-10-18T22:00:00+00:00"
+    assert period.start.isoformat() == "2026-10-25T23:00:00+00:00"
+
+
+def test_yandex_card_preserves_public_details_and_escapes_reply():
+    photo = "https://avatars.mds.yandex.net/get-maps-photo/example/S"
+    avatar = "https://avatars.mds.yandex.net/get-yapic/example/islands-68"
+    review = {"platform": "yandex", "rating": 1, "raw_payload_json": json.dumps({
+        "author": {"professionLevel": "Знаток города 3 уровня",
+                   "avatarUrl": avatar.replace("islands-68", "{size}")},
+        "reactions": {"likes": 0, "dislikes": 2},
+        "businessComment": {"text": "<b>Ответ</b>", "updatedTime": "2026-11-03T12:00:00Z"},
+        "photos": [{"urlTemplate": photo[:-1] + "{size}"},
+                   {"urlTemplate": "https://avatars.mds.yandex.net@outside.test/photo"}],
+    })}
+    details = review["details"] = review_details(review)
+    assert details["photos"] == [photo]
+    assert details["avatar"] == avatar
+    card = review_card(review, "Europe/Moscow", images={
+        photo: "data:image/jpeg;base64,YQ==", avatar: "data:image/jpeg;base64,Yg==",
+    })
+    assert "Знаток города 3 уровня" in card
+    assert "Официальный ответ" in card and "&lt;b&gt;Ответ&lt;/b&gt;" in card
+    assert "title='Нравится'" in card and "title='Не нравится'" in card
+    assert "Фото из отзыва" in card and "class='avatar'" in card
+    assert is_negative(review)
+
+
+def test_2gis_card_only_shows_returned_reactions():
+    review = {"platform": "2gis", "rating": 4, "sentiment": "negative",
+              "raw_payload_json": json.dumps({
+                  "likes_count": 4,
+                  "official_answer": {"text": "Ответ 2ГИС", "date_created": "2026-11-03T12:00:00Z"},
+                  "media": [{"photo": {"preview_urls": {
+                      "320x": "https://cachizer2.2gis.com/picture",
+                  }}}],
+              })}
+    details = review["details"] = review_details(review)
+    assert details["photos"] == ["https://cachizer2.2gis.com/picture"]
+    card = review_card(review, "Europe/Moscow")
+    assert "Ответ 2ГИС" in card and "title='Нравится'" in card
+    assert "title='Не нравится'" not in card
+    assert is_negative(review)
 
 
 def test_transliteration_is_suggestion_not_identity_binding():
@@ -260,3 +309,82 @@ async def test_repeated_history_page_is_not_marked_complete_or_alerted(monkeypat
     calls = repo.save_reviews.await_args_list
     assert len(calls[0].args[0]) == 50 and calls[0].kwargs["mark_sent"] is True
     assert not calls[1].args[0]  # No old review is placed in the live notification queue.
+
+
+@pytest.mark.asyncio
+async def test_report_upload_has_multipart_content_length(tmp_path):
+    from aiohttp import web
+    from aiogram import Bot
+    from aiogram.client.telegram import TelegramAPIServer
+    from aiogram.methods import SendDocument
+
+    from app.bot.files import ArgusBotSession, ReportInputFile
+
+    document = tmp_path / "report.pptx"
+    document.write_bytes(b"presentation body" * 5500)
+    received = {}
+
+    async def upload(request):
+        received["content_length"] = request.content_length
+        received["transfer_encoding"] = request.headers.get("Transfer-Encoding")
+        parts = await request.multipart()
+        async for part in parts:
+            if part.filename:
+                received["document"] = bytes(await part.read())
+        return web.json_response({
+            "ok": True, "result": {"message_id": 1, "date": 1794014400,
+                                    "chat": {"id": 42, "type": "private"}},
+        })
+
+    app = web.Application()
+    app.router.add_post("/bot{token}/sendDocument", upload)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    try:
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        _, port = runner.addresses[0]
+        api = TelegramAPIServer.from_base(f"http://127.0.0.1:{port}")
+        async with Bot("123456:TEST_ONLY", session=ArgusBotSession(api=api)) as bot:
+            await bot(SendDocument(chat_id=42, document=ReportInputFile(document)))
+    finally:
+        await runner.cleanup()
+    assert received["content_length"] > document.stat().st_size
+    assert received["transfer_encoding"] is None
+    assert received["document"] == document.read_bytes()
+
+
+def test_pack_cards_fills_space_beside_large_card_and_balances_tail():
+    from app.reports.render import CARD_HEIGHT, Card, pack_cards
+
+    cards = [Card("large", CARD_HEIGHT - 10, 2, "large")]
+    cards += [Card(str(i), 228, 1, str(i)) for i in range(7)]
+    pages = pack_cards(cards)
+    assert sum(len(page) for page in pages) == len(cards)
+    assert all(len(page) >= 2 for page in pages)
+    assert any(placed.columns == 2 for _, _, placed in pages[0])
+    assert len({placed.url for page in pages for _, _, placed in page}) == len(cards)
+    for page in pages:
+        for i, (col, y, card) in enumerate(page):
+            assert y + card.height <= CARD_HEIGHT
+            for other_col, other_y, other in page[:i]:
+                overlap_x = col < other_col + other.columns and other_col < col + card.columns
+                overlap_y = y < other_y + other.height and other_y < y + card.height
+                assert not (overlap_x and overlap_y)
+
+
+def test_comparison_is_previous_equal_calendar_period_even_for_months():
+    from app.reports.data import Period
+
+    period = Period.parse("01.10.2026 31.10.2026")
+    assert period.comparison_label == "31.08.2026–30.09.2026"
+
+
+def test_yandex_verified_owner_metadata_belongs_to_same_branch():
+    from app.reviews.client_yandex import YandexReviewsClient
+
+    client = YandexReviewsClient()
+    client._read_rating({"id": "wrong", "businessProperties": {"has_verified_owner": True}}, "42")
+    assert client.last_verified_owner is None
+    client._read_rating({"id": "42", "businessProperties": {"has_verified_owner": True}}, "42")
+    assert client.last_verified_owner is True

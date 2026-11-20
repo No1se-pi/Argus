@@ -18,6 +18,7 @@ class HistoricalReviewsLoader:
     def __init__(self, reviews_service):
         self.service = reviews_service
         self.observed: dict[int, set[str]] = {}
+        self.verified_owners: dict[int, bool] = {}
 
     async def ensure(self, period: Period, sources: list[dict]) -> list[str]:
         # Do not interleave history pagination and the live monitor's database work.
@@ -26,6 +27,7 @@ class HistoricalReviewsLoader:
 
     async def _ensure(self, period: Period, sources: list[dict]) -> list[str]:
         self.observed = {}
+        self.verified_owners = {}
         service = self.service
         proxy = service.settings.reviews_proxy_url
         proxy = proxy.get_secret_value() if proxy else None
@@ -54,7 +56,9 @@ class HistoricalReviewsLoader:
                 else DGisReviewsClient(proxy=proxy)
             )
             try:
-                complete = await self._load(client, current, period)
+                complete = await self._load(
+                    client, current, period, comparison_start=period.comparison_start
+                )
                 if not complete:
                     warnings.append(
                         f"{current.platform} / {current.branch_name}: "
@@ -67,11 +71,18 @@ class HistoricalReviewsLoader:
                     "сохранённые отзывы показаны без подтверждения полноты."
                 )
             finally:
+                verified = getattr(client, "last_verified_owner", None)
+                if current.platform == "yandex" and type(verified) is bool:
+                    self.verified_owners[current.id] = verified
                 await client.close()
             await asyncio.sleep(max(1, service.settings.reviews_request_pause_seconds))
         return warnings
 
-    async def _load(self, client, source: ReviewSource, period: Period) -> bool:
+    async def _load(
+        self, client, source: ReviewSource, period: Period, *, comparison_start=None
+    ) -> bool:
+        oldest = comparison_start or period.start
+        requested_complete = False
         seen = set()
         self.observed[source.id] = seen
         page_size = 50
@@ -132,8 +143,12 @@ class HistoricalReviewsLoader:
                         source.id, page, len(items), len(seen), ordered)
             # A pinned old review or an edited review must not terminate a mixed page.
             if ordered and max(dates) < period.start:
-                complete = True
-                break
+                requested_complete = True
+                if max(dates) < oldest:
+                    complete = True
+                    break
+            elif not ordered:
+                requested_complete = False
             has_more = getattr(client, "has_next_page", None)
             if has_more is not None:
                 if not has_more(source, page_size, page):
@@ -143,7 +158,7 @@ class HistoricalReviewsLoader:
                 complete = True
                 break
             await asyncio.sleep(max(1, self.service.settings.reviews_request_pause_seconds))
-        if complete:
+        if complete or requested_complete:
             connection = self.service.repository.database.require_connection()
             await connection.execute(
                 """INSERT INTO review_history_coverage(source_id,period_start,period_end,checked_at)
@@ -151,7 +166,7 @@ class HistoricalReviewsLoader:
                    period_start=excluded.period_start,period_end=excluded.period_end,checked_at=excluded.checked_at""",
                 (
                     source.id,
-                    period.start.isoformat(),
+                    (oldest if complete else period.start).isoformat(),
                     period.end.isoformat(),
                     datetime.now(UTC).isoformat(),
                 ),
@@ -159,4 +174,4 @@ class HistoricalReviewsLoader:
             await connection.commit()
         logger.info("Review history finished source_id=%s period=%s complete=%s unique=%s",
                     source.id, period.label, complete, len(seen))
-        return complete
+        return complete or requested_complete

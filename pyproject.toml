@@ -25,6 +25,7 @@ proxy = ["aiohttp-socks>=0.9,<1"]
 
 [tool.setuptools.package-data]
 "app.vk" = ["auth_ui/*.html", "auth_ui/*.css", "auth_ui/*.js"]
+"app.reports" = ["logos/*.png"]
 
 [tool.ruff]
 line-length = 100

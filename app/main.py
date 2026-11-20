@@ -5,13 +5,13 @@ from datetime import datetime, timezone
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from telethon import TelegramClient
 
 from app.alerts.service import AlertService
 from app.bot.access import AccessRequestService
 from app.bot.factory import create_dispatcher
+from app.bot.files import ArgusBotSession
 from app.collectors.telegram import TelegramCollector
 from app.config import get_settings
 from app.logging import setup_logging
@@ -52,10 +52,8 @@ async def main() -> None:
 
     bot = Bot(
         token=settings.bot_token.get_secret_value(),
-        session=(
-            AiohttpSession(proxy=settings.bot_proxy_url.get_secret_value())
-            if settings.bot_proxy_url
-            else None
+        session=ArgusBotSession(
+            proxy=settings.bot_proxy_url.get_secret_value() if settings.bot_proxy_url else None,
         ),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )

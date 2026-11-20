@@ -17,6 +17,21 @@ class Period:
     start: datetime
     end: datetime
     label: str
+    timezone_name: str = "Europe/Moscow"
+
+    @property
+    def comparison_start(self) -> datetime:
+        zone = resolve_timezone(self.timezone_name)
+        start = self.start.astimezone(zone)
+        days = (self.end.astimezone(zone).date() - start.date()).days
+        return (start - timedelta(days=days)).astimezone(UTC)
+
+    @property
+    def comparison_label(self) -> str:
+        zone = resolve_timezone(self.timezone_name)
+        first = self.comparison_start.astimezone(zone).date()
+        last = self.start.astimezone(zone).date() - timedelta(days=1)
+        return f"{first:%d.%m.%Y}–{last:%d.%m.%Y}"
 
     @classmethod
     def parse(cls, value: str, timezone_name: str = "Europe/Moscow"):
@@ -42,6 +57,7 @@ class Period:
             datetime.combine(dates[0], time.min, zone).astimezone(UTC),
             datetime.combine(dates[1] + timedelta(days=1), time.min, zone).astimezone(UTC),
             f"{dates[0]:%d.%m.%Y}–{dates[1]:%d.%m.%Y}",
+            timezone_name,
         )
 
 
@@ -101,7 +117,9 @@ def read_snapshot(path: Path, period: Period) -> dict:
         reviews = [
             dict(row)
             for row in connection.execute(
-                """SELECT r.*,s.branch_name FROM reviews r JOIN review_sources s ON s.id=r.source_id
+                """SELECT r.*,s.branch_name,a.sentiment FROM reviews r
+               JOIN review_sources s ON s.id=r.source_id
+               LEFT JOIN review_analysis a ON a.review_id=r.id
                WHERE julianday(r.published_at)>=julianday(?)
                AND julianday(r.published_at)<julianday(?) ORDER BY r.published_at,r.id LIMIT 501""",
                 (period.start.isoformat(), period.end.isoformat()),
@@ -118,7 +136,7 @@ def read_snapshot(path: Path, period: Period) -> dict:
             )
         for source in sources:
             verified = connection.execute(
-                """SELECT checked_at FROM review_history_coverage WHERE source_id=?
+                """SELECT checked_at, period_start FROM review_history_coverage WHERE source_id=?
                    AND julianday(period_start)<=julianday(?)
                    AND julianday(period_end)>=julianday(?)""",
                 (source["id"], period.start.isoformat(), period.end.isoformat()),
@@ -126,6 +144,10 @@ def read_snapshot(path: Path, period: Period) -> dict:
             # Having one old record does not prove that intervening pages were read.
             source["coverage_complete"] = bool(verified)
             source["coverage_checked_at"] = verified[0] if verified else None
+            source["comparison_covered"] = bool(
+                verified and period.comparison_start < period.start
+                and parse_iso_datetime(verified[1]) <= period.comparison_start
+            )
             if not source["coverage_complete"]:
                 warnings.append(
                     f"{source['platform']} / {source['branch_name']}: "
@@ -135,20 +157,43 @@ def read_snapshot(path: Path, period: Period) -> dict:
                 warnings.append(
                     f"{source['platform']} / {source['branch_name']}: источник имеет ошибку сбора."
                 )
-            source["rating_at_end"] = None
-            source["rating_change"] = None
-            for boundary, key in ((period.end, "rating_at_end"), (period.start, "rating_at_start")):
+            end = min(period.end, captured_at)
+            for boundary, suffix in ((end, "end"), (period.start, "start")):
                 row = connection.execute(
-                    """SELECT rating FROM review_rating_snapshots WHERE source_id=?
-                       AND julianday(captured_at)<=julianday(?)
-                       ORDER BY captured_at DESC LIMIT 1""",
-                    (source["id"], boundary.isoformat()),
+                    """SELECT rating,total_reviews_count,captured_at FROM review_rating_snapshots
+                       WHERE source_id=? AND julianday(captured_at)<=julianday(?)
+                       AND julianday(captured_at)>=julianday(?)
+                       ORDER BY julianday(captured_at) DESC LIMIT 1""",
+                    (source["id"], boundary.isoformat(), (boundary - timedelta(days=1)).isoformat()),
                 ).fetchone()
-                source[key] = row[0] if row else None
-            if source["rating_at_end"] is not None and source["rating_at_start"] is not None:
+                source[f"rating_at_{suffix}"] = row[0] if row else None
+                source[f"rating_count_at_{suffix}"] = row[1] if row else None
+                source[f"rating_captured_at_{suffix}"] = row[2] if row else None
+            latest = connection.execute(
+                """SELECT rating,total_reviews_count,captured_at FROM review_rating_snapshots
+                   WHERE source_id=? ORDER BY julianday(captured_at) DESC LIMIT 1""",
+                (source["id"],),
+            ).fetchone()
+            source["latest_rating"] = latest[0] if latest else None
+            source["latest_rating_count"] = latest[1] if latest else None
+            source["latest_rating_at"] = latest[2] if latest else None
+            source["rating_change"] = None
+            if (
+                source["rating_at_end"] is not None and source["rating_at_start"] is not None
+                and source["rating_captured_at_end"] != source["rating_captured_at_start"]
+            ):
                 source["rating_change"] = round(
                     source["rating_at_end"] - source["rating_at_start"], 2
                 )
+        previous_reviews = [
+            dict(row)
+            for row in connection.execute(
+                """SELECT source_id, external_review_id, rating FROM reviews
+                   WHERE julianday(published_at)>=julianday(?)
+                   AND julianday(published_at)<julianday(?)""",
+                (period.comparison_start.isoformat(), period.start.isoformat()),
+            )
+        ] if period.comparison_start < period.start else []
         reports = [
             json.loads(row[0])
             for row in connection.execute("SELECT payload_json FROM vk_like_reports ORDER BY id")
@@ -178,6 +223,7 @@ def read_snapshot(path: Path, period: Period) -> dict:
         return {
             "sources": sources,
             "reviews": reviews,
+            "comparison_reviews": previous_reviews,
             "cases": cases,
             "vk": vk,
             "identity_report": reports[-1] if reports else None,

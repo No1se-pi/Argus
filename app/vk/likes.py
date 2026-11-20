@@ -115,6 +115,35 @@ class VKLikesService:
         self.repository = repository
         self._lock = asyncio.Lock()
 
+    def _client(self, config) -> VKClient:
+        settings = self.vk_service.settings
+        token = likes_access_token(settings, config)
+        if not token:
+            raise ValueError("Подключите ВК, чтобы получить доступ к лайкам.")
+        return VKClient(
+            access_token=token,
+            api_version=settings.vk_api_version,
+            web_mode=bool(likes_web_token(settings, config)),
+            proxy=configured_vk_proxy(settings),
+        )
+
+    async def check_access(self) -> None:
+        config = await self.vk_service.effective_config()
+        if not config.enabled:
+            raise ValueError("VK Monitor выключен. Включите его командой /vk_watch_on.")
+        if not config.group_id:
+            raise ValueError("Сначала настройте сообщество ВК.")
+        client = self._client(config)
+        wall = await self._request(
+            client.request, "wall.get", {"owner_id": -abs(config.group_id), "count": 1},
+        )
+        posts = VKClient._validate_page(wall, "wall.get")["items"]
+        if posts:
+            await self._request(client.request, "likes.getList", {
+                "type": "post", "owner_id": -abs(config.group_id),
+                "item_id": posts[0]["id"], "count": 1, "friends_only": 0,
+            })
+
     async def collect(self, selection: LikesSelection) -> dict[str, Any]:
         if self._lock.locked():
             raise ValueError("Сбор лайков уже выполняется. Дождитесь завершения.")
@@ -122,21 +151,11 @@ class VKLikesService:
             config = await self.vk_service.effective_config()
             if not config.enabled:
                 raise ValueError("VK Monitor выключен. Включите его командой /vk_watch_on.")
-            token = likes_access_token(self.vk_service.settings, config)
-            if not token:
-                raise ValueError(
-                    "Для сбора нужен VK_SERVICE_ACCESS_TOKEN или VK_USER_ACCESS_TOKEN."
-                )
+            client = self._client(config)
             if not config.group_id and not selection.group_reference:
                 raise ValueError(
                     "Укажите ссылку на сообщество или настройте VK_GROUP_ID (/vk_setup)."
                 )
-            client = VKClient(
-                access_token=token,
-                api_version=self.vk_service.settings.vk_api_version,
-                web_mode=bool(likes_web_token(self.vk_service.settings, config)),
-                proxy=configured_vk_proxy(self.vk_service.settings),
-            )
             started = datetime.now(UTC).isoformat()
             group_id = config.group_id
             if selection.group_reference:
