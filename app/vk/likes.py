@@ -119,7 +119,10 @@ class VKLikesService:
         settings = self.vk_service.settings
         token = likes_access_token(settings, config)
         if not token:
-            raise ValueError("Подключите ВК, чтобы получить доступ к лайкам.")
+            raise ValueError(
+                "Подключите ВК, чтобы получить доступ к лайкам "
+                "(VK_SERVICE_ACCESS_TOKEN или VK_USER_ACCESS_TOKEN)."
+            )
         return VKClient(
             access_token=token,
             api_version=settings.vk_api_version,
