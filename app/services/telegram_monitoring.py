@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import re
+from dataclasses import replace
 from datetime import datetime, timezone
 from html import escape
 from time import monotonic
 
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from telethon import errors, events, types
 
@@ -238,17 +240,27 @@ class AnalysisWorker:
                 result = await self.classifier.classify(
                     row["text"] or "", reply_text=row.get("reply_text")
                 )
-                inserted = await self.repositories.telegram_monitoring.save_analysis(
-                    row["id"], result, self.classifier.client.model, PROMPT_VERSION
-                )
-                if (
-                    inserted
-                    and row["alert_eligible"]
+                send_alert = (
+                    row["alert_eligible"]
                     and is_live(row.get("message_date"), self._started_at)
                     and result.risk
                     and result.severity >= self.settings.llm_alert_min_severity
                     and await self._alerts_enabled()
+                )
+                if (
+                    send_alert
+                    and result.severity < 3
+                    and await self.repositories.telegram_monitoring.was_dismissed_in_context(row["id"])
                 ):
+                    send_alert = False
+                    result = replace(
+                        result, risk=False, severity=0, categories=[], intent_level="none",
+                        reason="Такой же текст в этом контексте уже помечен ложным алертом",
+                    )
+                inserted = await self.repositories.telegram_monitoring.save_analysis(
+                    row["id"], result, self.classifier.client.model, PROMPT_VERSION
+                )
+                if inserted and send_alert:
                     alert_id = await self.repositories.telegram_monitoring.create_risk_alert(
                         row["id"]
                     )
@@ -300,11 +312,14 @@ class AnalysisWorker:
         alert_id, chat_id = delivery["alert_id"], delivery["chat_id"]
         try:
             await self._send_delivery(chat_id, delivery["text"], alert_id)
+        except TelegramForbiddenError:
+            await self.repositories.telegram_monitoring.finish_risk_delivery(
+                alert_id, chat_id, "TelegramForbiddenError",
+            )
+            logger.info("Risk delivery stopped: recipient unavailable alert_id=%s", alert_id)
         except Exception as exc:
             await self.repositories.telegram_monitoring.finish_risk_delivery(
-                alert_id,
-                chat_id,
-                type(exc).__name__,
+                alert_id, chat_id, type(exc).__name__,
             )
             logger.warning(
                 "Risk alert queued for retry alert_id=%s error=%s", alert_id, type(exc).__name__

@@ -945,15 +945,22 @@ class TelegramMonitoringRepository:
     async def pending_risk_deliveries(self, limit: int = 50) -> list[dict]:
         connection = self.database.require_connection()
         async with connection.execute(
-            """SELECT * FROM telegram_risk_deliveries WHERE sent_at IS NULL
-               AND (next_retry_at IS NULL OR next_retry_at <= ?) ORDER BY alert_id LIMIT ?""",
+            """SELECT d.* FROM telegram_risk_deliveries d
+               JOIN telegram_risk_alerts a ON a.id=d.alert_id
+               WHERE d.sent_at IS NULL
+                 AND coalesce(d.last_error, '') <> 'TelegramForbiddenError'
+                 AND coalesce(a.verdict, '') <> 'false_positive'
+                 AND (d.next_retry_at IS NULL OR d.next_retry_at <= ?)
+               ORDER BY d.alert_id LIMIT ?""",
             (utc_now_iso(), limit),
         ) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
     async def finish_risk_delivery(self, alert_id: int, chat_id: int, error: str | None = None) -> None:
         connection = self.database.require_connection()
-        retry = (datetime.now(UTC) + timedelta(minutes=1)).isoformat() if error else None
+        retry = None
+        if error and error != "TelegramForbiddenError":
+            retry = (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
         await connection.execute(
             """UPDATE telegram_risk_deliveries SET sent_at=?, attempts=attempts+1,
                next_retry_at=?, last_error=? WHERE alert_id=? AND chat_id=?""",
@@ -1056,6 +1063,24 @@ class TelegramMonitoringRepository:
             tuple(params),
         ) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def was_dismissed_in_context(self, message_id: int) -> bool:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """SELECT a.verdict
+               FROM telegram_messages current
+               JOIN telegram_messages past
+                 ON past.source_id=current.source_id AND past.id<>current.id
+                AND past.text=current.text
+                AND past.reply_to_message_id IS current.reply_to_message_id
+               JOIN telegram_risk_alerts a ON a.message_id=past.id
+               WHERE current.id=? AND NULLIF(trim(current.text), '') IS NOT NULL
+                 AND a.verdict IN ('false_positive', 'confirmed')
+                 AND julianday(a.reviewed_at)>=julianday('now','-30 days')""",
+            (message_id,),
+        ) as cursor:
+            verdicts = {row["verdict"] for row in await cursor.fetchall()}
+        return verdicts == {"false_positive"}
 
     async def set_alert_feedback(self, alert_id: int, verdict: str, admin_id: int) -> bool:
         if verdict not in {"confirmed", "false_positive", "reviewed"}:

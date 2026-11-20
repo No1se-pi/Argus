@@ -385,3 +385,140 @@ async def test_digest_requests_plain_text_from_ollama():
     text = await service.build("2026-10-06")
     assert llm.json_mode is False
     assert "Краткая сводка" in text
+
+
+@pytest.mark.asyncio
+async def test_risk_delivery_skips_blocked_and_dismissed_alerts(tmp_path):
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+
+    from aiogram.exceptions import TelegramForbiddenError
+    from aiogram.methods import SendMessage
+
+    from app.services.telegram_monitoring import AnalysisWorker
+
+    database = Database(tmp_path / "risk-retry.sqlite3")
+    await database.connect()
+    try:
+        await init_schema(database)
+        repos = RepositoryBundle(database)
+        source = await repos.sources.upsert_telegram_source(
+            link="@test", username="test", title="Test", entity_id=123,
+            access_hash=456, entity_type="channel",
+        )
+        async def alert(number):
+            message_id, _ = await repos.telegram_monitoring.save_message(
+                source_id=source.id, telegram_message_id=number, reply_to_message_id=None,
+                text="Test", message_date=datetime.now(timezone.utc).isoformat(),
+                message_url=None, prefilter_priority=5,
+            )
+            return await repos.telegram_monitoring.create_risk_alert(message_id)
+
+        blocked = await alert(1)
+        dismissed = await alert(2)
+        await repos.telegram_monitoring.queue_risk_deliveries(blocked, [1], "Old alert")
+        await repos.telegram_monitoring.finish_risk_delivery(blocked, 1, "TelegramForbiddenError")
+        await repos.telegram_monitoring.queue_risk_deliveries(dismissed, [3], "False alarm")
+        await repos.telegram_monitoring.set_alert_feedback(dismissed, "false_positive", 10)
+
+        fresh = await alert(3)
+        await repos.telegram_monitoring.queue_risk_deliveries(fresh, [1, 2], "Fresh alert")
+        failure = TelegramForbiddenError(
+            method=SendMessage(chat_id=1, text="Fresh alert"), message="Bot was blocked",
+        )
+        bot = SimpleNamespace(send_message=AsyncMock(side_effect=[failure, None]))
+        worker = AnalysisWorker(settings=SimpleNamespace(llm_max_concurrent_requests=1),
+                                repositories=repos, classifier=None, bot=bot)
+        await worker._deliver_alerts()
+        await worker._deliver_alerts()
+        assert [call.args[0] for call in bot.send_message.await_args_list] == [1, 2]
+        assert not await repos.telegram_monitoring.pending_risk_deliveries()
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("previously_dismissed", "severity", "should_alert"), [
+    (True, 2, False), (False, 2, True), (True, 3, True),
+])
+async def test_worker_respects_feedback_without_suppressing_urgent_alerts(
+    previously_dismissed, severity, should_alert,
+):
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+
+    from app.services.llm.classifier import Classification
+    from app.services.telegram_monitoring import AnalysisWorker
+
+    first_pass = Classification(
+        True, severity, 0.86, ["harassment"], "negative", "chat", "Проверка", "intent"
+    )
+    classifier = SimpleNamespace(
+        classify=AsyncMock(return_value=first_pass),
+        client=SimpleNamespace(model="test-model"),
+    )
+    repo = SimpleNamespace(
+        save_analysis=AsyncMock(return_value=True), create_risk_alert=AsyncMock(return_value=1),
+        was_dismissed_in_context=AsyncMock(return_value=previously_dismissed),
+    )
+    worker = AnalysisWorker(
+        settings=SimpleNamespace(llm_max_concurrent_requests=1, llm_alert_min_severity=2),
+        repositories=SimpleNamespace(
+            telegram_monitoring=repo, runtime_settings=SimpleNamespace(
+                get_bool=AsyncMock(return_value=True),
+            ),
+        ),
+        classifier=classifier, bot=None,
+    )
+    worker._send_alert = AsyncMock()
+    row = {"id": 1, "text": "Сообщение", "reply_text": "Контекст", "alert_eligible": True,
+           "message_date": datetime.now(timezone.utc).isoformat()}
+    await worker._process(row)
+    saved = repo.save_analysis.await_args.args[1]
+    assert saved.risk is should_alert
+    assert saved.severity == (severity if should_alert else 0)
+    assert worker._send_alert.await_count == int(should_alert)
+
+
+@pytest.mark.asyncio
+async def test_feedback_matches_only_same_source_and_same_reply(tmp_path):
+    from datetime import datetime, timezone
+
+    database = Database(tmp_path / "verdict-context.sqlite3")
+    await database.connect()
+    try:
+        await init_schema(database)
+        repos = RepositoryBundle(database)
+        first = await repos.sources.upsert_telegram_source(
+            link="@first", username="first", title="First", entity_id=123,
+            access_hash=456, entity_type="channel",
+        )
+        other = await repos.sources.upsert_telegram_source(
+            link="@other", username="other", title="Other", entity_id=124,
+            access_hash=457, entity_type="channel",
+        )
+        async def save(source_id, number, parent):
+            result, _ = await repos.telegram_monitoring.save_message(
+                source_id=source_id, telegram_message_id=number, reply_to_message_id=parent,
+                text="Same words", message_date=datetime.now(timezone.utc).isoformat(),
+                message_url=None, prefilter_priority=5,
+            )
+            return result
+
+        original = await save(first.id, 1, 10)
+        review_id = await repos.telegram_monitoring.create_risk_alert(original)
+        await repos.telegram_monitoring.set_alert_feedback(review_id, "false_positive", 10)
+        duplicate = await save(first.id, 2, 10)
+        assert await repos.telegram_monitoring.was_dismissed_in_context(duplicate)
+        assert not await repos.telegram_monitoring.was_dismissed_in_context(
+            await save(first.id, 3, 11)
+        )
+        assert not await repos.telegram_monitoring.was_dismissed_in_context(
+            await save(other.id, 1, 10)
+        )
+        second = await save(first.id, 4, 10)
+        review_id = await repos.telegram_monitoring.create_risk_alert(second)
+        await repos.telegram_monitoring.set_alert_feedback(review_id, "confirmed", 10)
+        assert not await repos.telegram_monitoring.was_dismissed_in_context(duplicate)
+    finally:
+        await database.close()
