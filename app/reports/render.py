@@ -283,7 +283,7 @@ class ReportRenderer:
         return await asyncio.to_thread(compact_png, image)
 
     async def ratings(
-        self, branches: list[tuple[str, dict]], *, platform: str, period: str, previous_period: str,
+        self, branches: list[tuple[str, dict]], *, platform: str, period: str,
     ) -> list[bytes]:
         addresses = {
             "Датахаб": "1-я Парковая улица, 12",
@@ -304,32 +304,40 @@ class ReportRenderer:
                 if platform == "yandex" and source.get("verified_owner") is True else ""
             )
             address = addresses.get(branch, "")
-            rating = source.get("period_average")
+            rating = source.get("rating_at_end")
+            change = source.get("rating_change") if rating is not None else None
+            count = int(source.get("period_review_count") or 0)
+            detail = f"Отзывов за период: {count}"
+            if rating is None and source.get("latest_rating_at"):
+                rating = source.get("latest_rating")
+                captured_at = parse_iso_datetime(source["latest_rating_at"]).astimezone(
+                    resolve_timezone(self.timezone_name)
+                )
+                detail = f"Последний замер {captured_at:%d.%m.%Y}"
+            elif rating is None:
+                detail = "Нет замера рейтинга"
             value = "—" if rating is None else f"<span class='star'>★</span> {rating:.1f}"
-            change = source.get("average_rating_change")
             direction = ""
             if change is None:
                 delta = "Нет данных для сравнения"
-            elif change == 0:
+            elif round(change, 1) == 0:
                 delta = "Рейтинг не изменился"
             else:
                 direction = "up" if change > 0 else "down"
                 delta = f"Рейтинг {change:+.1f}"
-            count = int(source.get("period_review_count") or 0)
             rows.append(
                 "<div class='rating-row'>"
                 f"<div>{logo}<div class='rating-branch'>УО {escape(branch)}{check}</div>"
                 f"<div class='rating-address'>{escape(address)}</div></div>"
                 f"<div class='score'><div class='score-value'>{value}</div>"
-                f"<span class='volume'>Отзывов: {count}</span>"
+                f"<span class='volume'>{detail}</span>"
                 f"<span class='delta {direction}'>{delta}</span></div></div>"
             )
         platform_class = " dgis" if platform == "2gis" else ""
         return [
             await self.image(
                 "<div class='rating-top'>"
-                f"<div class='rating-note'>Средняя оценка отзывов · {escape(period)}"
-                f" к {escape(previous_period)}</div>"
+                f"<div class='rating-note'>Рейтинг карточек · {escape(period)}</div>"
                 f"<img class='platform-logo' alt='' src='{logo_data_url(PLATFORM_LOGOS[platform])}'>"
                 "</div>"
                 f"<main class='rating-panel{platform_class}'>"

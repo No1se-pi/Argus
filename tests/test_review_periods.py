@@ -184,3 +184,22 @@ async def test_blocked_recipient_is_terminal_and_never_blocks_other_targets(stor
     assert not await repos.reviews.get_unsent_reviews()
     assert await alerts.send_review_alert(saved, source, repos.reviews)
     assert sorted(attempts) == [111, 222]
+
+
+@pytest.mark.asyncio
+async def test_history_captures_card_rating_even_without_reviews(store):
+    db, repos, source = store
+    client = SimpleNamespace(
+        fetch_reviews=AsyncMock(
+            return_value=(ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200)
+        ),
+        last_rating=4.9,
+        last_total_count=86,
+    )
+    loader = HistoricalReviewsLoader(SimpleNamespace(repository=repos.reviews, notify_since=None))
+    period = Period.parse("09.11.2026 16.11.2026")
+    assert await loader._load(client, source, period)
+    snapshot = read_snapshot(db.path, period)
+    branch = next(item for item in snapshot["sources"] if item["id"] == source.id)
+    assert branch["latest_rating"] == 4.9 and branch["latest_rating_count"] == 86
+    assert not snapshot["reviews"]

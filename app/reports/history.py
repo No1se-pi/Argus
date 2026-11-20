@@ -90,6 +90,7 @@ class HistoricalReviewsLoader:
         complete = False
         ordered = True
         previous_date = None
+        rating_saved = False
         for page in range(1, 41):
             result = await client.fetch_reviews(source, page=page, page_size=page_size)
             # Retry one transient transport/server failure, never a CAPTCHA or rate limit.
@@ -106,6 +107,16 @@ class HistoricalReviewsLoader:
                 logger.warning("Review history source_id=%s page=%s status=%s error=%s",
                                source.id, page, result[0], result[2])
                 break
+            if not rating_saved:
+                rating, count = (
+                    (result[4], result[5]) if source.platform == "2gis"
+                    else (client.last_rating, getattr(client, "last_total_count", None))
+                )
+                if rating is not None:
+                    await self.service.repository.save_rating_snapshot(
+                        source.id, rating, count, datetime.now(UTC).isoformat()
+                    )
+                    rating_saved = True
             items = result[1]
             if not items:
                 complete = True
@@ -128,17 +139,6 @@ class HistoricalReviewsLoader:
                 (historical if date < quiet_before else live).append(item)
             await self.service.repository.save_reviews(historical, source.id, mark_sent=True)
             await self.service.repository.save_reviews(live, source.id, mark_sent=False)
-            if source.platform == "2gis" and result[4] is not None:
-                await self.service.repository.save_rating_snapshot(
-                    source.id, result[4], result[5], datetime.now(UTC).isoformat()
-                )
-            elif source.platform == "yandex" and client.last_rating is not None:
-                await self.service.repository.save_rating_snapshot(
-                    source.id,
-                    client.last_rating,
-                    client.last_total_count,
-                    datetime.now(UTC).isoformat(),
-                )
             logger.info("Review history source_id=%s page=%s items=%s unique=%s ordered=%s",
                         source.id, page, len(items), len(seen), ordered)
             # A pinned old review or an edited review must not terminate a mixed page.

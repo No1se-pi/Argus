@@ -210,7 +210,7 @@ class ActivityReportService:
                 platform_key = "2gis" if is_dgis else "yandex"
                 rating_images = await renderer.ratings(
                     deck.rating_branches(sources, dgis=is_dgis), platform=platform_key,
-                    period=snapshot["period"], previous_period=snapshot["comparison_period"],
+                    period=snapshot["period"],
                 )
                 ratings = [
                     Slide(rating_part, names[0], RenderedPage(image, []))

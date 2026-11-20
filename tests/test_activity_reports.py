@@ -388,3 +388,35 @@ def test_yandex_verified_owner_metadata_belongs_to_same_branch():
     assert client.last_verified_owner is None
     client._read_rating({"id": "42", "businessProperties": {"has_verified_owner": True}}, "42")
     assert client.last_verified_owner is True
+
+
+@pytest.mark.asyncio
+async def test_rating_cards_use_platform_snapshots_instead_of_review_averages(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from app.reports.render import ReportRenderer
+
+    renderer = ReportRenderer("Europe/Moscow")
+    image = AsyncMock()
+    monkeypatch.setattr(renderer, "image", image)
+    await renderer.ratings(
+        [
+            ("Датахаб", {
+                "rating_at_end": 4.9, "rating_change": -0.1,
+                "period_average": 5.0, "average_rating_change": 0,
+                "verified_owner": True,
+            }),
+            ("Кибер", {
+                "latest_rating": 4.8, "latest_rating_at": "2026-11-20T22:00:00Z",
+                "period_average": 5.0, "verified_owner": True,
+            }),
+            ("Техно", {"rating_at_end": 4.7, "rating_change": 0}),
+        ],
+        platform="2gis",
+        period="14.11.2026–20.11.2026",
+    )
+    html = image.await_args.args[0]
+    assert "4.9" in html and "Рейтинг -0.1" in html
+    assert "4.8" in html and "Последний замер 21.11.2026" in html
+    assert "Рейтинг не изменился" in html and "Нет данных для сравнения" in html
+    assert "5.0" not in html and "verified-owner" not in html
